@@ -1,0 +1,22 @@
+[package]
+name = "quantkit-exchanges"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quantkit-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+url = "2.0"
+log = { workspace = true }

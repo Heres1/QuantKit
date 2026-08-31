@@ -1,0 +1,24 @@
+[package]
+name = "quantkit-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "quickstart"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_ws"
+path = "src/test_ws.rs"
+
+[[bin]]
+name = "test_ws_continuous"
+path = "src/test_ws_continuous.rs"
+
+[dependencies]
+quantkit-core = { workspace = true }
+quantkit-exchanges = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

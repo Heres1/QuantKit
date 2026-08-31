@@ -1,0 +1,58 @@
+# Rust build artifacts
+/target
+**/target/
+
+# Build output
+*.log
+build/
+dist/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and config files with secrets
+.env
+.env.server
+quantkit.toml
+
+# State files (runtime data)
+quantkit_state.json
+live_*.json
+data/*.json
+.quantkit-web.pid
+
+# Data directory contents
+data/klines/
+data/factors/
+
+# Logs directory contents
+logs/*.log
+!logs/.gitkeep
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+
+# OS files
+Thumbs.db
+._*
+
+# Frontend build artifacts
+frontend/dist/
+frontend/node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+venv/
