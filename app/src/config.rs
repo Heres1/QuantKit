@@ -111,6 +111,9 @@ fn default_live_enabled() -> bool {
 fn default_live_auto_heal() -> bool {
     false
 }
+fn default_live_sync_external() -> bool {
+    true
+}
 fn default_web_port() -> u16 {
     8080
 }
@@ -221,6 +224,10 @@ pub struct AppConfig {
     /// 默认 false：只告警不改状态，由人工核对后决定。
     #[serde(default = "default_live_auto_heal")]
     pub live_auto_heal: bool,
+    /// live 场外订单同步：每轮增量查询 myTrades/openOrders，把手动成交纳入
+    /// 状态与流水并告警。默认开启；异常时可一键关停而不回滚代码。
+    #[serde(default = "default_live_sync_external")]
+    pub live_sync_external: bool,
     /// WebUI 监听端口（quantkit serve / quantkit-web）
     #[serde(default = "default_web_port")]
     pub web_port: u16,
@@ -278,6 +285,7 @@ impl Default for AppConfig {
             poll_secs: default_poll_secs(),
             live_enabled: default_live_enabled(),
             live_auto_heal: default_live_auto_heal(),
+            live_sync_external: default_live_sync_external(),
             web_port: default_web_port(),
             telegram_bot_token: default_telegram_token(),
             telegram_chat_id: default_telegram_chat_id(),

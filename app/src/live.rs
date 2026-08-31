@@ -27,8 +27,8 @@ use quantkit_core::engine::{run_backtest, BacktestConfig, FillPrice};
 use quantkit_core::executor::FillModel;
 use quantkit_core::interval::Interval;
 use quantkit_core::types::{Order, Position, Side};
-use quantkit_exchanges::binance::{now_ms, round_step, BinanceClient};
-use quantkit_exchanges::traits::{Broker, MarketData};
+use quantkit_exchanges::binance::{now_ms, round_step, BinanceClient, MyTrade, OpenOrder};
+use quantkit_exchanges::traits::MarketData;
 
 use crate::config::AppConfig;
 use crate::events::{DomainEvent, QuantKitEventBus};
@@ -62,7 +62,7 @@ pub struct EquitySnap {
 }
 
 /// live 状态（原子持久化）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiveState {
     pub last_bar_ts: u64,
     pub positions: Vec<Position>,
@@ -71,6 +71,17 @@ pub struct LiveState {
     #[serde(default)]
     pub equity_history: Vec<EquitySnap>,
     pub updated_at_ms: u64,
+    /// 场外订单同步：每品种已同步到的最大 myTrades tradeId（增量查询水位）
+    #[serde(default)]
+    pub trade_watermarks: BTreeMap<String, u64>,
+    /// 程序自下订单登记：品种 -> [(orderId, 该订单响应的最大 tradeId)]。
+    /// myTrades 增量行按 orderId 命中即"自己的单"（已入账，跳过），否则为场外成交；
+    /// 水印推过 max_trade_id 后该条目可安全裁剪。
+    #[serde(default)]
+    pub own_orders: BTreeMap<String, Vec<(u64, u64)>>,
+    /// 已通知过的在途挂单 orderId（重启不重复通知）
+    #[serde(default)]
+    pub known_open_order_ids: Vec<u64>,
 }
 
 /// 对账报告：漂移描述 + 自愈后的持仓（以交易所真实可用数量为准）
@@ -88,7 +99,10 @@ fn base_of(sym: &str) -> &str {
     sym.strip_suffix("USDT").filter(|s| !s.is_empty()).unwrap_or(sym)
 }
 
-/// 账户对账（纯函数，可单测）：比对本地状态持仓与交易所非零可用余额。
+/// 账户对账（纯函数，可单测）：比对本地状态持仓与交易所余额（可用+冻结总额）。
+///
+/// 用总额而非仅可用：手动限价挂单会锁定余额（如全额挂卖时 free=0），
+/// 只看 free 会把"持仓在、挂单中"误判为"已在场外卖出"。
 ///
 /// 漂移来源通常是：手续费以本币抵扣、人工在交易所买卖、历史漏记成交。
 /// `synced` 为以真实数量重写后的持仓（自愈用）；交易所存在而状态未记录的
@@ -96,7 +110,7 @@ fn base_of(sym: &str) -> &str {
 pub fn reconcile(
     symbols: &[String],
     local: &[Position],
-    balances: &BTreeMap<String, f64>,
+    balances: &BTreeMap<String, (f64, f64)>,
 ) -> ReconReport {
     let mut report = ReconReport::default();
     // 数量相对偏差容忍度：0.1%（正常成交与状态应严格一致，偏差即漂移）
@@ -108,18 +122,19 @@ pub fn reconcile(
         match balances.get(&base) {
             None => {
                 report.drifts.push(format!(
-                    "状态记录持仓 {} 量{:.8}，但交易所无可用余额（可能已在场外卖出）",
+                    "状态记录持仓 {} 量{:.8}，但交易所无余额（可用+冻结均为 0，可能已在场外卖出）",
                     p.symbol, p.quantity
                 ));
             }
-            Some(&actual) => {
+            Some(&(free, locked)) => {
+                let actual = free + locked;
                 if p.quantity > 0.0 && (actual - p.quantity).abs() / p.quantity > TOL {
                     report.drifts.push(format!(
-                        "{} 数量偏差：状态 {:.8} / 交易所可用 {:.8}",
-                        p.symbol, p.quantity, actual
+                        "{} 数量偏差：状态 {:.8} / 交易所总额 {:.8}（可用 {:.8} + 冻结 {:.8}）",
+                        p.symbol, p.quantity, actual, free, locked
                     ));
                 }
-                // 自愈：以交易所真实可用数量为准（入场价保留原记录）
+                // 自愈：以交易所真实总额为准（入场价保留原记录）
                 report.synced.push(Position {
                     symbol: p.symbol.clone(),
                     quantity: actual,
@@ -134,14 +149,322 @@ pub fn reconcile(
         if tracked_bases.contains(&base) {
             continue;
         }
-        if let Some(&amt) = balances.get(&base) {
+        if let Some(&(free, locked)) = balances.get(&base) {
+            let amt = free + locked;
+            if amt <= 0.0 {
+                continue;
+            }
             report.drifts.push(format!(
-                "交易所有可用余额 {base} {amt:.8}，但状态未记录持仓（可能人工买入或历史漏记）"
+                "交易所有余额 {base} {amt:.8}（可用 {free:.8} + 冻结 {locked:.8}），但状态未记录持仓（可能人工买入或历史漏记）"
             ));
             report.unrecorded.push((sym.clone(), amt));
         }
     }
     report
+}
+
+// ==================== 场外订单同步（手动单检测与入账） ====================
+
+/// 按时间序把场外成交逐笔应用到持仓（纯函数，可单测）。
+/// 买入：加权均价加仓/建仓；卖出：减仓/清仓。
+/// 超卖截断为 0 并产出告警（流水仍记真实全量，审计完整）；
+/// 无持仓记录的卖出不产生负仓位，仅告警。
+pub fn apply_external_trades(
+    positions: &mut Vec<Position>,
+    trades: &[(String, MyTrade)],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut sorted: Vec<&(String, MyTrade)> = trades.iter().collect();
+    sorted.sort_by_key(|(_, t)| t.time);
+    for (sym, t) in sorted {
+        if t.is_buyer {
+            match positions.iter_mut().find(|p| &p.symbol == sym) {
+                Some(p) => {
+                    let new_qty = p.quantity + t.qty;
+                    if new_qty > 0.0 {
+                        p.avg_entry_price =
+                            (p.quantity * p.avg_entry_price + t.qty * t.price) / new_qty;
+                    }
+                    p.quantity = new_qty;
+                }
+                None => positions.push(Position {
+                    symbol: sym.clone(),
+                    quantity: t.qty,
+                    avg_entry_price: t.price,
+                }),
+            }
+        } else {
+            match positions.iter_mut().find(|p| &p.symbol == sym) {
+                Some(p) => {
+                    if t.qty >= p.quantity * 0.999 {
+                        if t.qty > p.quantity * 1.001 {
+                            warnings.push(format!(
+                                "场外卖出 {} 数量 {:.8} 超过记录持仓 {:.8}，仓位截断为 0",
+                                sym, t.qty, p.quantity
+                            ));
+                        }
+                        p.quantity = 0.0;
+                    } else {
+                        p.quantity -= t.qty;
+                    }
+                }
+                None => warnings.push(format!(
+                    "场外卖出 {} 数量 {:.8}，但本地无持仓记录（可能历史买入未被跟踪）",
+                    sym, t.qty
+                )),
+            }
+        }
+    }
+    positions.retain(|p| p.quantity > 0.0);
+    warnings
+}
+
+/// 场外成交按（品种, 方向）聚合成流水条目（纯函数，可单测）。
+/// 手续费按数值累加；若含非 USDT 抵扣资产（如 BNB），在 reason 中说明。
+pub fn aggregate_external_fills(trades: &[(String, MyTrade)]) -> Vec<LiveFill> {
+    // 按（品种, 方向）聚合的累加器
+    #[derive(Default)]
+    struct Acc {
+        qty: f64,
+        cost: f64,
+        fee: f64,
+        ts: u64,
+        fee_mixed: bool,
+    }
+    let mut groups: BTreeMap<(String, bool), Acc> = BTreeMap::new();
+    for (sym, t) in trades {
+        let e = groups.entry((sym.clone(), t.is_buyer)).or_default();
+        e.qty += t.qty;
+        e.cost += t.qty * t.price;
+        e.fee += t.commission;
+        e.ts = e.ts.max(t.time);
+        if t.commission > 0.0 && t.commission_asset != "USDT" && !t.commission_asset.is_empty() {
+            e.fee_mixed = true;
+        }
+    }
+    groups
+        .into_iter()
+        .map(|((sym, is_buyer), a)| {
+            let mut reason = "场外手动单".to_string();
+            if a.fee_mixed {
+                reason.push_str("（含非USDT手续费资产）");
+            }
+            LiveFill {
+                ts: a.ts,
+                symbol: sym,
+                side: if is_buyer { Side::Buy } else { Side::Sell },
+                quantity: a.qty,
+                price: if a.qty > 0.0 { a.cost / a.qty } else { 0.0 },
+                fee: a.fee,
+                reason,
+            }
+        })
+        .collect()
+}
+
+/// 首次水印初始化：从最旧向新翻页，取最大 tradeId 作为水印。
+/// 不回补历史成交（历史漏记由启动对账接管）。无成交返回 0。
+/// 翻页超上限（10 万笔）报错，由调用方下轮重试——绝不把水印停在历史中间。
+async fn bootstrap_watermark(client: &BinanceClient, symbol: &str) -> Result<u64, String> {
+    let mut from: Option<u64> = None;
+    let mut max_id = 0u64;
+    for _ in 0..100 {
+        let page = client
+            .fetch_my_trades(symbol, from, 1000)
+            .await
+            .map_err(|e| e.to_string())?;
+        let n = page.len();
+        if let Some(m) = page.iter().map(|t| t.id).max() {
+            max_id = max_id.max(m);
+            from = Some(m + 1);
+        }
+        if n < 1000 {
+            return Ok(max_id);
+        }
+    }
+    Err(format!("{symbol} 成交历史超过 10 万笔，水印初始化放弃（请人工处理）"))
+}
+
+/// 场外成交同步（每轮）：对池内品种增量拉取 myTrades，按 orderId 分类
+/// （命中程序自下订单登记的跳过），手动成交纳入持仓与流水并告警。
+/// 补偿链路：单品种失败只告警、水印不动、下轮重试，绝不阻断调仓主路。
+async fn sync_external_trades(
+    cfg: &AppConfig,
+    client: &BinanceClient,
+    st: &mut LiveState,
+    state_path: &Path,
+    notify: &Notifier,
+) {
+    let mut external: Vec<(String, MyTrade)> = Vec::new();
+    let mut changed = false;
+
+    for sym in &cfg.symbols {
+        // 惰性初始化水印：首次见到该品种时翻全历史定位水位（不回补历史）
+        if !st.trade_watermarks.contains_key(sym) {
+            match bootstrap_watermark(client, sym).await {
+                Ok(wm) => {
+                    info!("🧭 {sym} 成交水印初始化: {wm}（此前历史不回填，漏记由对账接管）");
+                    st.trade_watermarks.insert(sym.clone(), wm);
+                    changed = true;
+                }
+                Err(e) => {
+                    warn!("⏭️ {sym} 水印初始化失败（下轮重试）: {e}");
+                    continue;
+                }
+            }
+        }
+        let wm = match st.trade_watermarks.get(sym) {
+            Some(&w) => w,
+            None => continue,
+        };
+
+        // 增量拉取（fromId 语义含边界值，后面按 id > wm 去重；整页续翻，每轮最多 3 页）
+        let mut rows: Vec<MyTrade> = Vec::new();
+        let mut from = wm + 1;
+        let mut failed = false;
+        for _ in 0..3 {
+            match client.fetch_my_trades(sym, Some(from), 1000).await {
+                Ok(page) => {
+                    let n = page.len();
+                    if let Some(m) = page.iter().map(|t| t.id).max() {
+                        from = m + 1;
+                    }
+                    rows.extend(page);
+                    if n < 1000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("⏭️ {sym} myTrades 拉取失败（水印不动，下轮重试）: {e}");
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+
+        let own_ids: Vec<u64> = st
+            .own_orders
+            .get(sym)
+            .map(|v| v.iter().map(|(o, _)| *o).collect())
+            .unwrap_or_default();
+        let mut max_id = wm;
+        for t in rows {
+            if t.id <= wm {
+                continue;
+            }
+            max_id = max_id.max(t.id);
+            if own_ids.contains(&t.order_id) {
+                continue; // 程序自下单：下单时已入账
+            }
+            external.push((sym.clone(), t));
+        }
+        if max_id > wm {
+            st.trade_watermarks.insert(sym.clone(), max_id);
+            changed = true;
+        }
+    }
+
+    // 裁剪自有订单登记：max_trade_id 已被水印覆盖的条目不会再被查询命中。
+    // （0 = 幂等恢复路径无法得知，保留以保证分类正确）
+    for (sym, orders) in st.own_orders.iter_mut() {
+        let wm = st.trade_watermarks.get(sym).copied().unwrap_or(0);
+        let before = orders.len();
+        orders.retain(|&(_, max_tid)| max_tid == 0 || max_tid > wm);
+        if orders.len() != before {
+            changed = true;
+        }
+    }
+
+    if !external.is_empty() {
+        let fills = aggregate_external_fills(&external);
+        let warnings = apply_external_trades(&mut st.positions, &external);
+        for f in &fills {
+            let side = match f.side {
+                Side::Buy => "买入",
+                Side::Sell => "卖出",
+            };
+            action!(
+                "🖐️",
+                "检测到场外成交: {} {} | 量 {:.8} | 价 {:.6} | 费 {:.6}",
+                f.symbol, side, f.quantity, f.price, f.fee
+            );
+            notify
+                .send(&fill_message(&f.symbol, side, f.quantity, f.price, f.fee, &f.reason))
+                .await;
+        }
+        for w in &warnings {
+            warn!("🖐️ {w}");
+            notify.send(&format!("[quantkit 实盘] {w}")).await;
+        }
+        st.fills.extend(fills);
+        changed = true;
+    }
+
+    if changed {
+        st.updated_at_ms = now_ms();
+        if let Err(e) = save_state_atomic(state_path, st) {
+            error!("场外同步后状态保存失败: {e}");
+        }
+    }
+}
+
+/// 在途挂单监控（每轮）：全账户拉取一次（含 OCO 两腿），过滤池内品种，
+/// 新出现的挂单日志 + Telegram 通知并持久化；消失不通知
+/// （成交由 myTrades 链路通知，撤单不影响状态）。
+async fn sync_open_orders(
+    cfg: &AppConfig,
+    client: &BinanceClient,
+    st: &mut LiveState,
+    state_path: &Path,
+    notify: &Notifier,
+) {
+    let all = match client.fetch_open_orders(None).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("⏭️ openOrders 查询失败（本轮跳过）: {e}");
+            return;
+        }
+    };
+    let pool: Vec<&OpenOrder> = all.iter().filter(|o| cfg.symbols.contains(&o.symbol)).collect();
+    let fresh: Vec<&OpenOrder> = pool
+        .iter()
+        .filter(|o| !st.known_open_order_ids.contains(&o.order_id))
+        .copied()
+        .collect();
+    let cur_ids: Vec<u64> = pool.iter().map(|o| o.order_id).collect();
+
+    for o in &fresh {
+        let side = if o.side == "BUY" { "买入" } else { "卖出" };
+        action!(
+            "📋",
+            "检测到在途挂单（场外下单）: {} {} | 委托价 {:.6} | 量 {:.8} | 已成交 {:.8}",
+            o.symbol, side, o.price, o.orig_qty, o.executed_qty
+        );
+    }
+    if !fresh.is_empty() {
+        let summary: Vec<String> = fresh
+            .iter()
+            .map(|o| format!("{} {}", o.symbol, if o.side == "BUY" { "买入" } else { "卖出" }))
+            .collect();
+        notify
+            .send(&format!(
+                "[quantkit 实盘] 检测到 {} 笔在途挂单（场外下单）: {}",
+                fresh.len(),
+                summary.join("、")
+            ))
+            .await;
+    }
+
+    if cur_ids != st.known_open_order_ids {
+        st.known_open_order_ids = cur_ids;
+        st.updated_at_ms = now_ms();
+        if let Err(e) = save_state_atomic(state_path, st) {
+            error!("挂单同步后状态保存失败: {e}");
+        }
+    }
 }
 
 pub async fn run(cfg: &AppConfig, interval: Interval) {
@@ -273,7 +596,7 @@ pub async fn run(cfg: &AppConfig, interval: Interval) {
         info!("📂 恢复状态: 持仓 {} 个 | 历史成交 {} 笔",
             s.positions.len(), s.fills.len());
     }
-    match client.fetch_balances().await {
+    match client.fetch_balances_full().await {
         Ok(bal) => {
             let local = state.as_ref().map(|s| s.positions.as_slice()).unwrap_or(&[]);
             let report = reconcile(&cfg.symbols, local, &bal);
@@ -316,13 +639,14 @@ pub async fn run(cfg: &AppConfig, interval: Interval) {
                         fills: Vec::new(),
                         equity_history: Vec::new(),
                         updated_at_ms: now_ms(),
+                        ..Default::default()
                     });
                     st.positions = positions;
                     st.updated_at_ms = now_ms();
                     if let Err(e) = save_state_atomic(&state_path, st) {
                         error!("自愈后状态保存失败: {e}");
                     } else {
-                        action!("💊", "已自愈：持仓数量以交易所真实可用余额为准");
+                        action!("💊", "已自愈：持仓数量以交易所真实余额（可用+冻结）为准");
                     }
                 } else {
                     warn!("存在漂移但未开启自愈（live_auto_heal = false）：继续按本地状态运行，请人工核对");
@@ -411,8 +735,28 @@ async fn run_cycle(
     notify: &Notifier,
     event_bus: Option<&Arc<QuantKitEventBus>>, // 改为事件总线
 ) -> Result<(), String> {
-    // 1) 获取 K线数据：优先使用事件总线缓存，回退到 REST
     let now = now_ms();
+
+    // 1) 确保状态存在（前置：即使本轮 K线 失败，场外同步与快照仍能执行）
+    if state.is_none() {
+        *state = Some(LiveState {
+            last_bar_ts: 0,
+            positions: Vec::new(),
+            fills: Vec::new(),
+            equity_history: Vec::new(),
+            updated_at_ms: now,
+            ..Default::default()
+        });
+    }
+    let st = state.as_mut().expect("状态已初始化");
+
+    // 2) 场外订单同步：手动成交/在途挂单检测（补偿链路，失败只告警不阻断调仓）
+    if cfg.live_sync_external {
+        sync_external_trades(cfg, client, st, state_path, notify).await;
+        sync_open_orders(cfg, client, st, state_path, notify).await;
+    }
+
+    // 3) 获取 K线数据：优先使用事件总线缓存，回退到 REST
     let mut data: BTreeMap<String, Vec<quantkit_core::types::Kline>> = BTreeMap::new();
     
     if let Some(bus) = event_bus {
@@ -456,19 +800,7 @@ async fn run_cycle(
         .max()
         .unwrap_or(0);
 
-    // 确保状态存在（后续统一引用，不再克隆回写）
-    if state.is_none() {
-        *state = Some(LiveState {
-            last_bar_ts: 0,
-            positions: Vec::new(),
-            fills: Vec::new(),
-            equity_history: Vec::new(),
-            updated_at_ms: now,
-        });
-    }
-    let st = state.as_mut().expect("状态已初始化");
-
-    // 2) 权益快照：每轮盯市一点（与是否同bar决策无关），构成实盘权益曲线；
+    // 4) 权益快照：每轮盯市一点（与是否同bar决策无关），构成实盘权益曲线；
     // 有新快照即落盘，监控页随时可读到最新总资产
     if snapshot_equity(client, st).await {
         st.updated_at_ms = now_ms();
@@ -480,7 +812,7 @@ async fn run_cycle(
         return Ok(());
     }
 
-    // 3) 重放得出目标持仓（只要品种，不要模拟数量——数量用真实余额定；
+    // 5) 重放得出目标持仓（只要品种，不要模拟数量——数量用真实余额定；
     // Top-N 分散时目标可为多品种）
     let mut strategy = crate::build_strategy(cfg, interval);
     let bt = BacktestConfig {
@@ -540,14 +872,17 @@ async fn run_cycle(
                 // 确定性幂等 ID：同 bar+品种+方向重试时 ID 相同，交易所据此防重复下单
                 let id = format!("qk_{}_{}_S", last_bar_ts, h.symbol);
                 let reason = "信号调仓：卖出非目标品种";
-                let fill = match client.place_order(&Order::market_sell(&h.symbol, qty), Some(&id)).await {
-                    Ok(f) => f,
+                let exec = match client.place_order_with_meta(&Order::market_sell(&h.symbol, qty), Some(&id)).await {
+                    Ok(x) => x,
                     Err(e) => {
                         let msg = format!("卖出 {} 失败: {e}", h.symbol);
                         notify.send(&format!("[quantkit 实盘] {msg}")).await;
                         return Err(msg);
                     }
                 };
+                // 登记自有订单：场外同步按 orderId 识别，避免把程序单误判为手动单
+                st.own_orders.entry(h.symbol.clone()).or_default().push((exec.order_id, exec.max_trade_id));
+                let fill = exec.fill;
                 action!("🔴", "卖出 {} | 量 {:.8} | 价 {:.6} | 费 {:.6}",
                     fill.symbol, fill.quantity, fill.price, fill.fee);
                 notify.send(&fill_message(&fill.symbol, "卖出", fill.quantity, fill.price, fill.fee, reason)).await;
@@ -580,14 +915,16 @@ async fn run_cycle(
                 if qty >= min_qty && price > 0.0 {
                     let buy_id = format!("qk_{}_{}_B", last_bar_ts, sym);
                     let reason = "信号调仓：买入新目标品种";
-                    let fill = match client.place_order(&Order::market_buy(sym, qty), Some(&buy_id)).await {
-                        Ok(f) => f,
+                    let exec = match client.place_order_with_meta(&Order::market_buy(sym, qty), Some(&buy_id)).await {
+                        Ok(x) => x,
                         Err(e) => {
                             let msg = format!("买入 {sym} 失败: {e}");
                             notify.send(&format!("[quantkit 实盘] {msg}")).await;
                             return Err(msg);
                         }
                     };
+                    st.own_orders.entry(sym.clone()).or_default().push((exec.order_id, exec.max_trade_id));
+                    let fill = exec.fill;
                     action!("🟢", "买入 {} | 量 {:.8} | 价 {:.6} | 费 {:.6}",
                         fill.symbol, fill.quantity, fill.price, fill.fee);
                     notify.send(&fill_message(&fill.symbol, "买入", fill.quantity, fill.price, fill.fee, reason)).await;
@@ -634,14 +971,15 @@ async fn run_cycle(
 /// 权益快照：以最新价盯市，记录总资产/USDT/持仓市值。返回是否新增了点。
 /// 失败只告警不阻断（快照是监控旁路，不是交易链路）。
 async fn snapshot_equity(client: &mut BinanceClient, st: &mut LiveState) -> bool {
-    let balances = match client.fetch_balances().await {
+    let balances = match client.fetch_balances_full().await {
         Ok(b) => b,
         Err(e) => {
             warn!("权益快照跳过（余额查询失败）: {e}");
             return false;
         }
     };
-    let usdt = balances.get("USDT").copied().unwrap_or(0.0);
+    // USDT 计总额：挂单锁定的部分仍是自己的资产，不计入会让曲线在挂单时假跳水
+    let usdt = balances.get("USDT").map(|&(f, l)| f + l).unwrap_or(0.0);
     let mut positions_value = 0.0;
     for p in &st.positions {
         match client.fetch_last_price(&p.symbol).await {
@@ -704,8 +1042,8 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
         let local = vec![pos("BTCUSDT", 1.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);
-        bal.insert("USDT".into(), 5000.0);
+        bal.insert("BTC".into(), (1.0, 0.0));
+        bal.insert("USDT".into(), (5000.0, 0.0));
         let r = reconcile(&symbols, &local, &bal);
         assert!(r.drifts.is_empty(), "{:?}", r.drifts);
         assert_eq!(r.synced.len(), 1);
@@ -718,7 +1056,7 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string()];
         let local = vec![pos("BTCUSDT", 1.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 0.998);
+        bal.insert("BTC".into(), (0.998, 0.0));
         let r = reconcile(&symbols, &local, &bal);
         assert_eq!(r.drifts.len(), 1);
         assert!(r.drifts[0].contains("数量偏差"));
@@ -734,8 +1072,164 @@ mod tests {
         let bal = BTreeMap::new();
         let r = reconcile(&symbols, &local, &bal);
         assert_eq!(r.drifts.len(), 1);
-        assert!(r.drifts[0].contains("无可用余额"));
+        assert!(r.drifts[0].contains("无余额"));
         assert!(r.synced.is_empty());
+    }
+
+    fn trade(id: u64, is_buyer: bool, qty: f64, price: f64, time: u64) -> MyTrade {
+        MyTrade {
+            id,
+            order_id: id * 10,
+            price,
+            qty,
+            commission: 0.0,
+            commission_asset: "USDT".into(),
+            time,
+            is_buyer,
+        }
+    }
+
+    #[test]
+    fn test_reconcile_locked_balance_no_false_drift() {
+        // 限价挂单锁定余额（可用=0、全额冻结）：总额口径不误判为"已在场外卖出"
+        let symbols = vec!["LINKUSDT".to_string()];
+        let local = vec![pos("LINKUSDT", 17.36)];
+        let mut bal = BTreeMap::new();
+        bal.insert("LINK".into(), (0.0, 17.36));
+        let r = reconcile(&symbols, &local, &bal);
+        assert!(r.drifts.is_empty(), "{:?}", r.drifts);
+        assert!((r.synced[0].quantity - 17.36).abs() < 1e-12);
+
+        // 部分可用 + 部分冻结：总额一致同样不告警
+        bal.insert("LINK".into(), (7.36, 10.0));
+        let r = reconcile(&symbols, &local, &bal);
+        assert!(r.drifts.is_empty(), "{:?}", r.drifts);
+    }
+
+    #[test]
+    fn test_reconcile_unrecorded_locked_only() {
+        // 未记录资产全部冻结（如手动买入后挂出）：同样按总额告警并收入接管列表
+        let symbols = vec!["BTCUSDT".to_string()];
+        let local: Vec<Position> = vec![];
+        let mut bal = BTreeMap::new();
+        bal.insert("BTC".into(), (0.0, 0.5));
+        let r = reconcile(&symbols, &local, &bal);
+        assert_eq!(r.drifts.len(), 1);
+        assert_eq!(r.unrecorded.len(), 1);
+        assert_eq!(r.unrecorded[0], ("BTCUSDT".to_string(), 0.5));
+    }
+
+    #[test]
+    fn test_apply_external_trades_open_and_add_weighted() {
+        // 买入建仓；再加仓时入场价按加权均价更新
+        let mut positions: Vec<Position> = vec![];
+        let trades = vec![
+            ("BTCUSDT".to_string(), trade(1, true, 1.0, 100.0, 1000)),
+            ("BTCUSDT".to_string(), trade(2, true, 1.0, 200.0, 2000)),
+        ];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert!(w.is_empty(), "{:?}", w);
+        assert_eq!(positions.len(), 1);
+        assert!((positions[0].quantity - 2.0).abs() < 1e-12);
+        assert!((positions[0].avg_entry_price - 150.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_external_trades_reduce_and_close() {
+        // 卖出部分减仓（入场价不变）；卖光清仓并从列表移除
+        let mut positions = vec![pos("BTCUSDT", 2.0)];
+        let trades = vec![("BTCUSDT".to_string(), trade(1, false, 0.5, 120.0, 1000))];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert!(w.is_empty(), "{:?}", w);
+        assert!((positions[0].quantity - 1.5).abs() < 1e-12);
+        assert!((positions[0].avg_entry_price - 100.0).abs() < 1e-12);
+
+        let trades = vec![("BTCUSDT".to_string(), trade(2, false, 1.5, 130.0, 2000))];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(positions.is_empty(), "清仓应移除持仓");
+    }
+
+    #[test]
+    fn test_apply_external_trades_oversell_truncation() {
+        // 超卖（>0.1%）：告警且仓位截断为 0
+        let mut positions = vec![pos("BTCUSDT", 1.0)];
+        let trades = vec![("BTCUSDT".to_string(), trade(1, false, 1.2, 120.0, 1000))];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("超过记录持仓"));
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_apply_external_trades_close_within_dust_tolerance() {
+        // 卖出量略超持仓（≤0.1%，灰尘级别）：正常清仓不告警
+        let mut positions = vec![pos("BTCUSDT", 1.0)];
+        let trades = vec![("BTCUSDT".to_string(), trade(1, false, 1.0005, 120.0, 1000))];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_apply_external_trades_sell_without_position() {
+        // 无持仓记录的卖出：仅告警，不产生负仓位
+        let mut positions: Vec<Position> = vec![];
+        let trades = vec![("ETHUSDT".to_string(), trade(1, false, 5.0, 3000.0, 1000))];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("无持仓记录"));
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_apply_external_trades_time_ordering() {
+        // 同批乱序传入：按 time 排序应用（先卖后买），先卖因无持仓告警
+        let mut positions: Vec<Position> = vec![];
+        let trades = vec![
+            ("BTCUSDT".to_string(), trade(2, true, 2.0, 110.0, 2000)),
+            ("BTCUSDT".to_string(), trade(1, false, 1.0, 105.0, 1000)),
+        ];
+        let w = apply_external_trades(&mut positions, &trades);
+        assert_eq!(w.len(), 1, "{:?}", w);
+        assert_eq!(positions.len(), 1);
+        assert!((positions[0].quantity - 2.0).abs() < 1e-12);
+        assert!((positions[0].avg_entry_price - 110.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_aggregate_external_fills_grouping() {
+        // 按（品种, 方向）聚合：加权均价、手续费累加、ts 取最大；非 USDT 手续费标注
+        let trades = vec![
+            ("BTCUSDT".to_string(), MyTrade {
+                id: 1, order_id: 10, price: 100.0, qty: 1.0,
+                commission: 0.5, commission_asset: "USDT".into(), time: 1000, is_buyer: true,
+            }),
+            ("BTCUSDT".to_string(), MyTrade {
+                id: 2, order_id: 11, price: 200.0, qty: 3.0,
+                commission: 1.5, commission_asset: "USDT".into(), time: 2000, is_buyer: true,
+            }),
+            ("ETHUSDT".to_string(), MyTrade {
+                id: 3, order_id: 12, price: 3000.0, qty: 2.0,
+                commission: 0.01, commission_asset: "BNB".into(), time: 1500, is_buyer: false,
+            }),
+        ];
+        let fills = aggregate_external_fills(&trades);
+        assert_eq!(fills.len(), 2);
+        // BTreeMap 按键有序：BTCUSDT 买入在前，ETHUSDT 卖出在后
+        let buy = &fills[0];
+        assert_eq!(buy.symbol, "BTCUSDT");
+        assert_eq!(buy.side, Side::Buy);
+        assert!((buy.quantity - 4.0).abs() < 1e-12);
+        assert!((buy.price - 175.0).abs() < 1e-12); // (1*100 + 3*200) / 4
+        assert!((buy.fee - 2.0).abs() < 1e-12);
+        assert_eq!(buy.ts, 2000);
+        assert_eq!(buy.reason, "场外手动单");
+        let sell = &fills[1];
+        assert_eq!(sell.symbol, "ETHUSDT");
+        assert_eq!(sell.side, Side::Sell);
+        assert!((sell.quantity - 2.0).abs() < 1e-12);
+        assert_eq!(sell.reason, "场外手动单（含非USDT手续费资产）");
     }
 
     #[test]
@@ -745,10 +1239,10 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string(), "SOLUSDT".to_string()];
         let local = vec![pos("BTCUSDT", 1.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0005); // 0.05% < 0.1%：不告警
-        bal.insert("SOL".into(), 10.0); // 未记录持仓：告警
-        bal.insert("DOGE".into(), 999.0); // 池外：忽略
-        bal.insert("USDT".into(), 100.0); // 计价币：忽略
+        bal.insert("BTC".into(), (1.0005, 0.0)); // 0.05% < 0.1%：不告警
+        bal.insert("SOL".into(), (10.0, 0.0)); // 未记录持仓：告警
+        bal.insert("DOGE".into(), (999.0, 0.0)); // 池外：忽略
+        bal.insert("USDT".into(), (100.0, 0.0)); // 计价币：忽略
         let r = reconcile(&symbols, &local, &bal);
         assert_eq!(r.drifts.len(), 1);
         assert!(r.drifts[0].contains("SOL"));
@@ -779,7 +1273,7 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string()];
         let local: Vec<Position> = vec![];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);
+        bal.insert("BTC".into(), (1.0, 0.0));
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -805,10 +1299,10 @@ mod tests {
             pos("SOLUSDT", 100.0),
         ];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);
-        bal.insert("ETH".into(), 10.0);
-        bal.insert("SOL".into(), 100.0);
-        bal.insert("USDT".into(), 5000.0);
+        bal.insert("BTC".into(), (1.0, 0.0));
+        bal.insert("ETH".into(), (10.0, 0.0));
+        bal.insert("SOL".into(), (100.0, 0.0));
+        bal.insert("USDT".into(), (5000.0, 0.0));
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -825,14 +1319,14 @@ mod tests {
         // 刚好在容忍度内（0.1%）
         let local = vec![pos("BTCUSDT", 1.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.001); // 0.1% 偏差
+        bal.insert("BTC".into(), (1.001, 0.0)); // 0.1% 偏差
         
         let r = reconcile(&symbols, &local, &bal);
         // 0.1% 刚好等于 TOL，不应该告警（> 才告警）
         assert!(r.drifts.is_empty());
         
         // 稍微超过容忍度
-        bal.insert("BTC".into(), 1.0011); // 0.11% 偏差
+        bal.insert("BTC".into(), (1.0011, 0.0)); // 0.11% 偏差
         let r = reconcile(&symbols, &local, &bal);
         assert_eq!(r.drifts.len(), 1);
         assert!(r.drifts[0].contains("数量偏差"));
@@ -871,6 +1365,7 @@ mod tests {
                 positions_value: 50000.0,
             }],
             updated_at_ms: 1234567890000,
+            ..Default::default()
         };
         
         // 保存状态
@@ -956,7 +1451,7 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string()];
         let local = vec![pos("BTCUSDT", 0.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);
+        bal.insert("BTC".into(), (1.0, 0.0));
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -992,6 +1487,7 @@ mod tests {
             fills: Vec::new(),
             equity_history: Vec::new(),
             updated_at_ms: 1234567890000,
+            ..Default::default()
         };
         
         let json = serde_json::to_string(&state).unwrap();
@@ -1008,7 +1504,7 @@ mod tests {
         let symbols = vec!["ETHUSDT".to_string()];
         let local = vec![pos("ETHUSDT", 100.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("ETH".into(), 50.0); // 50% 偏差
+        bal.insert("ETH".into(), (50.0, 0.0)); // 50% 偏差
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -1027,9 +1523,9 @@ mod tests {
         ];
         let local: Vec<Position> = vec![]; // 本地无持仓
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 0.5);
-        bal.insert("ETH".into(), 5.0);
-        bal.insert("SOL".into(), 50.0);
+        bal.insert("BTC".into(), (0.5, 0.0));
+        bal.insert("ETH".into(), (5.0, 0.0));
+        bal.insert("SOL".into(), (50.0, 0.0));
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -1066,6 +1562,7 @@ mod tests {
             fills,
             equity_history: Vec::new(),
             updated_at_ms: 1234567890000,
+            ..Default::default()
         };
         
         save_state_atomic(&test_file, &state).unwrap();
@@ -1091,9 +1588,9 @@ mod tests {
             pos("ETHUSDT", 10.0),     // 漂移
         ];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);       // 一致
-        bal.insert("ETH".into(), 9.5);       // 5% 偏差
-        bal.insert("SOL".into(), 100.0);     // 未记录
+        bal.insert("BTC".into(), (1.0, 0.0));       // 一致
+        bal.insert("ETH".into(), (9.5, 0.0));       // 5% 偏差
+        bal.insert("SOL".into(), (100.0, 0.0));     // 未记录
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -1130,6 +1627,7 @@ mod tests {
             fills: Vec::new(),
             equity_history: history,
             updated_at_ms: 1234567890000,
+            ..Default::default()
         };
         
         // 模拟 snapshot_equity 中的滚动逻辑
@@ -1175,11 +1673,11 @@ mod tests {
             pos("SOLUSDT", 100.0),
         ];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);
-        bal.insert("ETH".into(), 10.0);
-        bal.insert("BNB".into(), 5.0);
-        bal.insert("SOL".into(), 100.0);
-        bal.insert("USDT".into(), 10000.0);
+        bal.insert("BTC".into(), (1.0, 0.0));
+        bal.insert("ETH".into(), (10.0, 0.0));
+        bal.insert("BNB".into(), (5.0, 0.0));
+        bal.insert("SOL".into(), (100.0, 0.0));
+        bal.insert("USDT".into(), (10000.0, 0.0));
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -1217,6 +1715,7 @@ mod tests {
             fills: Vec::new(),
             equity_history: Vec::new(),
             updated_at_ms: 1234567890000,
+            ..Default::default()
         };
         
         save_state_atomic(&test_file, &state).unwrap();
@@ -1234,7 +1733,7 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string()];
         let local = vec![pos("BTCUSDT", 1.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 0.5); // 只有状态的一半
+        bal.insert("BTC".into(), (0.5, 0.0)); // 只有状态的一半
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -1292,8 +1791,8 @@ mod tests {
         ];
         let local = vec![pos("BTCUSDT", 1.0)]; // 只有 BTC
         let mut bal = BTreeMap::new();
-        bal.insert("BTC".into(), 1.0);       // 一致
-        bal.insert("ETH".into(), 5.0);       // 未记录
+        bal.insert("BTC".into(), (1.0, 0.0));       // 一致
+        bal.insert("ETH".into(), (5.0, 0.0));       // 未记录
         // SOL 无余额
         
         let r = reconcile(&symbols, &local, &bal);
@@ -1323,6 +1822,7 @@ mod tests {
             fills: vec![],
             equity_history: vec![],
             updated_at_ms: 1000,
+            ..Default::default()
         };
         save_state_atomic(&test_file, &state1).unwrap();
         
@@ -1333,6 +1833,7 @@ mod tests {
             fills: vec![],
             equity_history: vec![],
             updated_at_ms: 2000,
+            ..Default::default()
         };
         save_state_atomic(&test_file, &state2).unwrap();
         
@@ -1349,7 +1850,7 @@ mod tests {
         let symbols = vec!["SHIBUSDT".to_string()];
         let local = vec![pos("SHIBUSDT", 1000000.0)];
         let mut bal = BTreeMap::new();
-        bal.insert("SHIB".into(), 1000000.5); // 微小偏差
+        bal.insert("SHIB".into(), (1000000.5, 0.0)); // 微小偏差
         
         let r = reconcile(&symbols, &local, &bal);
         
@@ -1376,6 +1877,7 @@ mod tests {
             fills: Vec::new(),
             equity_history: history,
             updated_at_ms: 0,
+            ..Default::default()
         };
         
         // 刚好 100,000 点，不应该触发滚动删除

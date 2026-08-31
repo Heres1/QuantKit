@@ -196,6 +196,110 @@ pub fn parse_ticker_24h(v: &Value) -> Result<Vec<TickerQuote>, BinanceError> {
     Ok(out)
 }
 
+/// 账户历史成交行（/api/v3/myTrades）。场外订单同步用：
+/// `id` 是全市场递增的成交序号，配合本地水印做增量切片。
+#[derive(Debug, Clone, Serialize)]
+pub struct MyTrade {
+    pub id: u64,
+    pub order_id: u64,
+    pub price: f64,
+    pub qty: f64,
+    pub commission: f64,
+    pub commission_asset: String,
+    pub time: u64,
+    pub is_buyer: bool,
+}
+
+/// 在途挂单（/api/v3/openOrders）
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenOrder {
+    pub order_id: u64,
+    pub client_order_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub price: f64,
+    pub orig_qty: f64,
+    pub executed_qty: f64,
+    pub status: String,
+    pub time: u64,
+}
+
+/// 聚合成交 + 交易所订单元数据。场外订单同步用 `order_id` 区分
+/// "程序自下的单"与"手动单"，`max_trade_id` 用于安全裁剪 own_orders。
+#[derive(Debug, Clone)]
+pub struct OrderExecution {
+    pub fill: Fill,
+    pub order_id: u64,
+    pub max_trade_id: u64,
+}
+
+fn num_field(v: &Value, key: &str) -> f64 {
+    match v.get(key) {
+        Some(Value::String(s)) => s.parse().unwrap_or(0.0),
+        Some(n) => n.as_f64().unwrap_or(0.0),
+        None => 0.0,
+    }
+}
+
+fn int_field(v: &Value, key: &str) -> u64 {
+    match v.get(key) {
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        Some(n) => n.as_u64().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// 解析 /api/v3/myTrades 响应（纯函数，可单测）
+pub fn parse_my_trades(v: &Value) -> Result<Vec<MyTrade>, BinanceError> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| BinanceError::Parse("myTrades 响应不是数组".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        out.push(MyTrade {
+            id: int_field(row, "id"),
+            order_id: int_field(row, "orderId"),
+            price: num_field(row, "price"),
+            qty: num_field(row, "qty"),
+            commission: num_field(row, "commission"),
+            commission_asset: row
+                .get("commissionAsset")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            time: int_field(row, "time"),
+            is_buyer: row.get("isBuyer").and_then(|b| b.as_bool()).unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// 解析 /api/v3/openOrders 响应（纯函数，可单测）
+pub fn parse_open_orders(v: &Value) -> Result<Vec<OpenOrder>, BinanceError> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| BinanceError::Parse("openOrders 响应不是数组".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        out.push(OpenOrder {
+            order_id: int_field(row, "orderId"),
+            client_order_id: row
+                .get("clientOrderId")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            symbol: row.get("symbol").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            side: row.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            price: num_field(row, "price"),
+            orig_qty: num_field(row, "origQty"),
+            executed_qty: num_field(row, "executedQty"),
+            status: row.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            time: int_field(row, "time"),
+        });
+    }
+    Ok(out)
+}
+
 /// Binance 现货客户端
 pub struct BinanceClient {
     http: reqwest::Client,
@@ -459,6 +563,65 @@ impl BinanceClient {
         Ok(bps as f64 / 10_000.0)
     }
 
+    /// 账户历史成交（场外订单同步用）。`from_id` 增量分页：
+    /// 传 水印+1 即只取新成交；不带则从最旧返回。单页上限 1000。
+    /// 注意 fromId 语义为“从该 id 起（含）”，调用方仍须按 `id > 水印` 自行去重。
+    pub async fn fetch_my_trades(
+        &self,
+        symbol: &str,
+        from_id: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MyTrade>, BinanceError> {
+        let mut params = BTreeMap::new();
+        params.insert("symbol".into(), symbol.to_string());
+        if let Some(id) = from_id {
+            params.insert("fromId".into(), id.to_string());
+        }
+        params.insert("limit".into(), limit.min(1000).to_string());
+        let v = self.get_json_signed("/api/v3/myTrades", &params).await?;
+        parse_my_trades(&v)
+    }
+
+    /// 在途挂单。`None` = 全账户一次拉取（权重 80，能拿全 OCO 两腿）；
+    /// `Some(symbol)` = 单品种（权重 6）。
+    pub async fn fetch_open_orders(
+        &self,
+        symbol: Option<&str>,
+    ) -> Result<Vec<OpenOrder>, BinanceError> {
+        let mut params = BTreeMap::new();
+        if let Some(s) = symbol {
+            params.insert("symbol".into(), s.to_string());
+        }
+        let v = self.get_json_signed("/api/v3/openOrders", &params).await?;
+        parse_open_orders(&v)
+    }
+
+    /// 全部非零余额（资产 -> (free, locked)）。
+    /// 对账与权益快照用总额（挂单锁定的部分仍是自己的资产）；
+    /// 卖出钳制请用 [`fetch_balances`]（只有可用余额卖得出）。
+    pub async fn fetch_balances_full(&self) -> Result<BTreeMap<String, (f64, f64)>, BinanceError> {
+        let v = self.get_json_signed("/api/v3/account", &BTreeMap::new()).await?;
+        let arr = v
+            .get("balances")
+            .and_then(|b| b.as_array())
+            .ok_or_else(|| BinanceError::Parse("balances 解析失败".into()))?;
+        let mut out = BTreeMap::new();
+        for b in arr {
+            let asset = b.get("asset").and_then(|a| a.as_str()).unwrap_or("");
+            let num = |k: &str| -> f64 {
+                b.get(k)
+                    .and_then(|f| f.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0)
+            };
+            let (free, locked) = (num("free"), num("locked"));
+            if !asset.is_empty() && (free > 0.0 || locked > 0.0) {
+                out.insert(asset.to_string(), (free, locked));
+            }
+        }
+        Ok(out)
+    }
+
     /// 按 clientOrderId 查询订单：网络超时后的幂等恢复（已提交则取回真实成交）。
     /// 订单不存在（-2013）返回 Ok(None)。
     async fn fetch_order_by_client_id(
@@ -699,8 +862,9 @@ impl MarketData for BinanceClient {
     }
 }
 
-/// RESULT 下单响应 / 查单响应的 fills 数组（可能多笔分撮合）聚合为单笔成交
-fn aggregate_fills(v: &Value, order: &Order) -> Result<Fill, BinanceError> {
+/// RESULT 下单响应 / 查单响应的 fills 数组（可能多笔分撮合）聚合为单笔成交，
+/// 并提取交易所订单元数据（orderId / 最大 tradeId）供场外订单同步分类。
+fn aggregate_fills(v: &Value, order: &Order) -> Result<OrderExecution, BinanceError> {
     let fills = v
         .get("fills")
         .and_then(|f| f.as_array())
@@ -708,6 +872,7 @@ fn aggregate_fills(v: &Value, order: &Order) -> Result<Fill, BinanceError> {
     let mut qty = 0.0;
     let mut cost = 0.0;
     let mut fee = 0.0;
+    let mut max_trade_id = 0u64;
     for f in fills {
         let q: f64 = f["qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let p: f64 = f["price"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -715,35 +880,56 @@ fn aggregate_fills(v: &Value, order: &Order) -> Result<Fill, BinanceError> {
         qty += q;
         cost += q * p;
         fee += c;
+        max_trade_id = max_trade_id.max(int_field(f, "tradeId"));
     }
     if qty <= 0.0 {
         return Err(BinanceError::Parse("成交数量为 0".into()));
     }
-    Ok(Fill {
-        symbol: order.symbol.clone(),
-        side: order.side,
-        quantity: qty,
-        price: cost / qty,
-        fee,
-        timestamp: v
-            .get("transactTime")
-            .or_else(|| v.get("time"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or_else(now_ms),
+    Ok(OrderExecution {
+        fill: Fill {
+            symbol: order.symbol.clone(),
+            side: order.side,
+            quantity: qty,
+            price: cost / qty,
+            fee,
+            timestamp: v
+                .get("transactTime")
+                .or_else(|| v.get("time"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or_else(now_ms),
+        },
+        order_id: int_field(v, "orderId"),
+        max_trade_id,
     })
 }
 
 #[async_trait]
 impl Broker for BinanceClient {
-    /// 市价下单（live 通道使用）。数量须调用方按 stepSize 取整。
-    ///
-    /// `client_order_id` 为幂等 ID：网络超时后可能"请求已送达成交但响应丢失"，
-    /// 此时凭该 ID 查询恢复真实成交，绝不盲目重发；上层重试须复用同一 ID。
+    /// 市价下单（委托 [`place_order_with_meta`]，只取聚合成交）
     async fn place_order(
         &mut self,
         order: &Order,
         client_order_id: Option<&str>,
     ) -> Result<Fill, ExecError> {
+        Ok(self.place_order_with_meta(order, client_order_id).await?.fill)
+    }
+}
+
+impl BinanceClient {
+    /// 市价下单（live 通道使用）+ 交易所订单元数据。数量须调用方按 stepSize 取整。
+    ///
+    /// `client_order_id` 为幂等 ID：网络超时后可能"请求已送达成交但响应丢失"，
+    /// 此时凭该 ID 查询恢复真实成交，绝不盲目重发；上层重试须复用同一 ID。
+    ///
+    /// 返回的 `order_id` / `max_trade_id` 供场外订单同步登记自有订单，
+    /// 之后 myTrades 增量查询按 orderId 区分"自己下的"与"手动下的"。
+    /// （幂等恢复路径走 GET /api/v3/order，响应无 fills 明细时 max_trade_id 为 0，
+    /// 该订单条目不会被裁剪，仅占极少内存，分类正确性不受影响。）
+    pub async fn place_order_with_meta(
+        &mut self,
+        order: &Order,
+        client_order_id: Option<&str>,
+    ) -> Result<OrderExecution, ExecError> {
         let side = match order.side {
             Side::Buy => "BUY",
             Side::Sell => "SELL",
@@ -828,6 +1014,76 @@ mod tests {
         assert!((qs[2].price_change_pct - 10.0).abs() < 1e-9);
         // 非数组响应应报错
         assert!(parse_ticker_24h(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn test_parse_my_trades() {
+        let v: Value = serde_json::from_str(
+            r#"[{"symbol":"LINKUSDT","id":28457,"orderId":100234,"price":"11.46000000",
+                 "qty":"17.36000000","quoteQty":"198.95040000","commission":"0.14921280",
+                 "commissionAsset":"USDT","time":1756741200000,"isBuyer":false,"isMaker":true,
+                 "isBestMatch":true},
+                {"id":28458,"orderId":100235,"price":"11.40","qty":"1.0","commission":"0",
+                 "commissionAsset":"BNB","time":1756741300000,"isBuyer":true}]"#,
+        )
+        .unwrap();
+        let ts = parse_my_trades(&v).unwrap();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].id, 28457);
+        assert_eq!(ts[0].order_id, 100234);
+        assert!((ts[0].price - 11.46).abs() < 1e-9);
+        assert!((ts[0].qty - 17.36).abs() < 1e-9);
+        assert!((ts[0].commission - 0.14921280).abs() < 1e-12);
+        assert_eq!(ts[0].commission_asset, "USDT");
+        assert_eq!(ts[0].time, 1756741200000);
+        assert!(!ts[0].is_buyer);
+        assert!(ts[1].is_buyer);
+        assert_eq!(ts[1].commission_asset, "BNB");
+        // 空数组合法；非数组报错
+        assert!(parse_my_trades(&Value::Array(vec![])).unwrap().is_empty());
+        assert!(parse_my_trades(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn test_parse_open_orders() {
+        let v: Value = serde_json::from_str(
+            r#"[{"symbol":"LINKUSDT","orderId":7972313177,"clientOrderId":"ios_abc",
+                 "price":"11.46000000","origQty":"17.36000000","executedQty":"0.00000000",
+                 "status":"NEW","side":"SELL","time":1756741000000},
+                {"orderId":123,"price":"1.0"}]"#,
+        )
+        .unwrap();
+        let os = parse_open_orders(&v).unwrap();
+        assert_eq!(os.len(), 2);
+        assert_eq!(os[0].order_id, 7972313177);
+        assert_eq!(os[0].symbol, "LINKUSDT");
+        assert_eq!(os[0].side, "SELL");
+        assert!((os[0].price - 11.46).abs() < 1e-9);
+        assert!((os[0].orig_qty - 17.36).abs() < 1e-9);
+        assert_eq!(os[0].executed_qty, 0.0);
+        assert_eq!(os[0].status, "NEW");
+        // 缺字段容错：空串/0
+        assert_eq!(os[1].symbol, "");
+        assert_eq!(os[1].status, "");
+        assert!(parse_open_orders(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn test_aggregate_fills_with_meta() {
+        let order = Order::market_buy("LINKUSDT", 2.0);
+        let v: Value = serde_json::from_str(
+            r#"{"orderId":555,"transactTime":1756741200123,
+                 "fills":[{"price":"11.30","qty":"1.0","commission":"0.008","commissionAsset":"USDT","tradeId":900},
+                          {"price":"11.50","qty":"1.0","commission":"0.008","commissionAsset":"USDT","tradeId":902}]}"#,
+        )
+        .unwrap();
+        let exec = aggregate_fills(&v, &order).unwrap();
+        assert_eq!(exec.order_id, 555);
+        assert_eq!(exec.max_trade_id, 902);
+        assert!((exec.fill.quantity - 2.0).abs() < 1e-9);
+        assert!((exec.fill.price - 11.40).abs() < 1e-9);
+        assert!((exec.fill.fee - 0.016).abs() < 1e-12);
+        assert_eq!(exec.fill.timestamp, 1756741200123);
     }
 
     #[test]

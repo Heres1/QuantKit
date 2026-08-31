@@ -16,6 +16,7 @@ import type {
   LiveAnalysis,
   LiveEquity,
   LiveFillRow,
+  LiveOpenOrders,
   LiveOverview,
   MarketRegime,
   Quote,
@@ -206,6 +207,8 @@ export const api = {
     request<{ fills: LiveFillRow[]; total: number }>(`/api/live/fills?limit=${limit}`),
   /** 真实账户资产（交易所余额+盯市，15s 缓存；需 Token） */
   liveAccount: () => request<LiveAccount>("/api/live/account"),
+  /** 在途挂单（手动限价单等未成交委托，15s 缓存；需 Token） */
+  liveOpenOrders: () => request<LiveOpenOrders>("/api/live/open-orders"),
   /** 实盘绩效：轮次配对净利润/胜率/回撤（需 Token） */
   liveAnalysis: () => request<LiveAnalysis>("/api/live/analysis"),
 };

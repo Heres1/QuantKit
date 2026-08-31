@@ -13,6 +13,7 @@ import type {
   LiveAnalysis,
   LiveEquity,
   LiveFillRow,
+  LiveOpenOrderRow,
   LiveOverview,
   RunInfo,
 } from "../types";
@@ -791,19 +792,23 @@ function LiveMonitor() {
   const [eq, setEq] = useState<LiveEquity | null>(null);
   const [fills, setFills] = useState<LiveFillRow[]>([]);
   const [fillTotal, setFillTotal] = useState(0);
+  const [orders, setOrders] = useState<LiveOpenOrderRow[]>([]);
   const [err, setErr] = useState("");
 
   const load = useCallback(async () => {
     try {
-      const [p, e, f] = await Promise.all([
+      const [p, e, f, oo] = await Promise.all([
         api.livePositions(),
         api.liveEquity(),
         api.liveFills(50),
+        // 挂单接口失败不影响监控主面板（如后端未升级时）
+        api.liveOpenOrders().catch(() => null),
       ]);
       setOv(p);
       setEq(e);
       setFills(f.fills);
       setFillTotal(f.total);
+      setOrders(oo?.orders ?? []);
       setErr("");
     } catch (e) {
       setErr((e as Error).message);
@@ -927,6 +932,38 @@ function LiveMonitor() {
           </table>
         )}
       </div>
+
+      {orders.length > 0 && (
+        <div className="card table-wrap">
+          <h3>在途挂单（{orders.length} 笔，锁定资金不计入可用余额）</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>品种</th>
+                <th>方向</th>
+                <th>委托价</th>
+                <th>数量</th>
+                <th>已成交</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.map((o, i) => (
+                <tr key={`${o.symbol}-${i}`}>
+                  <td>{o.symbol}</td>
+                  <td style={{ color: o.side === "BUY" ? "#26a69a" : "#ef5350" }}>
+                    {o.side === "BUY" ? "买入" : "卖出"}
+                  </td>
+                  <td>{fmtPrice(o.price)}</td>
+                  <td>{fmtNum(o.orig_qty, 6)}</td>
+                  <td>{fmtNum(o.executed_qty, 6)}</td>
+                  <td className="muted">{o.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <div className="card table-wrap">
         <h3>成交流水（最新 50 笔，共 {fillTotal} 笔）</h3>

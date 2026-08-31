@@ -357,6 +357,23 @@ export interface LiveFillRow {
   reason: string;
 }
 
+/** 在途挂单（交易所未成交委托，含手动限价单） */
+export interface LiveOpenOrderRow {
+  symbol: string;
+  /** "BUY" / "SELL" */
+  side: string;
+  price: number;
+  orig_qty: number;
+  executed_qty: number;
+  status: string;
+  time: number;
+}
+
+export interface LiveOpenOrders {
+  orders: LiveOpenOrderRow[];
+  updated_at_ms: number;
+}
+
 // 市场环境分析（基于本地日K + 实时价，样本 <51 根的品种已剔除）
 export interface RegimeSymbol {
   symbol: string;

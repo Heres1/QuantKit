@@ -53,6 +53,8 @@ struct AppState {
     binance: Arc<BinanceClient>,
     /// 账户资产缓存：(生成时刻, 响应)。余额+盯市逐资产取价，15s 内复用避免打接口配额
     account: Mutex<Option<(u64, serde_json::Value)>>,
+    /// 在途挂单缓存：(生成时刻, 响应)。全账户 openOrders（权重 80），15s 复用
+    open_orders: Mutex<Option<(u64, serde_json::Value)>>,
     /// 市场环境分析缓存：(生成时刻, 响应)。基于本地日K+实时价，60s 复用避免重复扫盘/拉行情
     regime: Mutex<Option<(u64, serde_json::Value)>>,
     /// 当前部署的代码版本（启动时探测）：短哈希，工作区有改动时带 -dirty 后缀
@@ -148,6 +150,7 @@ pub async fn serve(cfg: AppConfig) {
         markets: Mutex::new(None),
         binance: Arc::new(BinanceClient::public()),
         account: Mutex::new(None),
+        open_orders: Mutex::new(None),
         regime: Mutex::new(None),
         git_commit,
         cfg,
@@ -167,6 +170,7 @@ pub async fn serve(cfg: AppConfig) {
         .route("/api/live/equity", get(api_live_equity))
         .route("/api/live/fills", get(api_live_fills))
         .route("/api/live/account", get(api_live_account))
+        .route("/api/live/open-orders", get(api_live_open_orders))
         .route("/api/live/analysis", get(api_live_analysis))
         .layer(middleware::from_fn(token_guard));
 
@@ -1873,6 +1877,52 @@ async fn api_live_account(State(st): State<Arc<AppState>>) -> Resp {
         "updated_at_ms": now,
     });
     *st.account.lock().await = Some((now, out.clone()));
+    ok_json(out)
+}
+
+/// 在途挂单：全账户 openOrders（一次拿全含 OCO 两腿，权重 80），过滤策略池内
+/// 品种后返回。用于可视化手动限价单（场外下单锁定余额，避免误读持仓/权益）。
+/// 15s 缓存，密钥/权限失败即报错不缓存。
+async fn api_live_open_orders(State(st): State<Arc<AppState>>) -> Resp {
+    const CACHE_MS: u64 = 15_000;
+    let now = now_ms();
+    {
+        let g = st.open_orders.lock().await;
+        if let Some((ts, v)) = g.as_ref() {
+            if now.saturating_sub(*ts) < CACHE_MS {
+                return ok_json(v.clone());
+            }
+        }
+    }
+    let (key, secret) = resolve_binance_keys(&st.cfg);
+    let (Some(key), Some(secret)) = (key, secret) else {
+        return err_resp("未配置 Binance 密钥（环境变量或 quantkit.toml [binance] 段）".into());
+    };
+    let client = BinanceClient::with_credentials(Some(key), Some(secret));
+    let all = match client.fetch_open_orders(None).await {
+        Ok(v) => v,
+        Err(e) => return err_resp(format!("挂单查询失败: {e}")),
+    };
+    let orders: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|o| st.cfg.symbols.contains(&o.symbol))
+        .map(|o| {
+            serde_json::json!({
+                "symbol": o.symbol,
+                "side": o.side,
+                "price": o.price,
+                "orig_qty": o.orig_qty,
+                "executed_qty": o.executed_qty,
+                "status": o.status,
+                "time": o.time,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "orders": orders,
+        "updated_at_ms": now,
+    });
+    *st.open_orders.lock().await = Some((now, out.clone()));
     ok_json(out)
 }
 
