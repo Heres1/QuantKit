@@ -10,6 +10,7 @@ pub mod live;
 pub mod logging;
 pub mod notify;
 pub mod optimize;
+pub mod risk;
 
 use config::AppConfig;
 use quantkit_core::engine::BacktestConfig;

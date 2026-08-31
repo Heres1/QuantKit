@@ -33,6 +33,7 @@ use quantkit_exchanges::traits::MarketData;
 use crate::config::AppConfig;
 use crate::events::{DomainEvent, QuantKitEventBus};
 use crate::notify::{fill_message, Notifier};
+use crate::risk;
 
 // 日志宏导入
 use crate::{action, error, info, warn};
@@ -487,6 +488,7 @@ pub async fn run(cfg: &AppConfig, interval: Interval) {
     if notify.enabled() {
         info!("📱 Telegram 通知已启用");
     }
+    info!("🛡️ 风控闸门: {}", risk::describe(&cfg.risk));
 
     // --- 启动自检 ---
     let fee_rate = match preflight(&mut client, cfg).await {
@@ -895,27 +897,116 @@ async fn run_cycle(
         }
         st.positions.retain(|p| targets.contains(&p.symbol));
 
-        // 3b) 再买：新进入品种以真实可用余额等额分配（留存品种不调仓）
+        // 3b) 再买：新进入品种以真实可用余额等额分配（留存品种不调仓）。
+        //     下单前过风控闸门（只拦开新仓，永不拦卖出回笼资金）
         let new_targets: Vec<String> = targets
             .iter()
             .filter(|t| !held_syms.contains(t))
             .cloned()
             .collect();
         if !new_targets.is_empty() {
-            let bal = client.fetch_usdt_balance().await
-                .map_err(|e| format!("余额查询失败: {e}"))?;
-            // 预留约 0.2% 余量（单边手续费 + 市价成交价可能高于最新价），再按品种数均分
-            let per = bal * 0.998 / new_targets.len() as f64;
+            // 3b-i) 候选品种行情与精度（下单必需，先一次性取齐）
+            let mut quotes: Vec<(String, f64, f64, f64)> = Vec::new(); // (品种, 最新价, step, minQty)
             for sym in &new_targets {
                 let price = client.fetch_last_price(sym).await
                     .map_err(|e| format!("价格查询失败: {e}"))?;
                 let (step, min_qty) = client.fetch_step_size(sym).await
                     .map_err(|e| format!("精度查询失败: {e}"))?;
-                let qty = round_step(per / price, step);
-                if qty >= min_qty && price > 0.0 {
+                quotes.push((sym.clone(), price, step, min_qty));
+            }
+
+            // 3b-ii) 风控闸门：输入全部来自持久化状态（重启不丢），输出放行清单
+            // (品种, 最新价, 数量, minQty)
+            let buys: Vec<(String, f64, f64, f64)> = {
+                // 敞口取最近一次权益快照的盯市市值（卖出发生在本轮快照之后，
+                // 数值可能略偏旧；该口径仅在总敞口规则启用时影响判断）
+                let exposure = st.equity_history.last().map(|s| s.positions_value).unwrap_or(0.0);
+                let gate_ctx = risk::GateContext {
+                    now_ms: now,
+                    positions: &st.positions,
+                    fills: &st.fills,
+                    equity_history: &st.equity_history,
+                    exposure,
+                };
+
+                let global_block = risk::gate_account(&cfg.risk, &gate_ctx);
+                if !global_block.is_empty() {
+                    let msg = format!("风控拦截本轮全部买入: {}", global_block.join("；"));
+                    warn!("🛡️ {msg}");
+                    notify.send(&format!("[quantkit 实盘] 🛡️ {msg}")).await;
+                    Vec::new()
+                } else {
+                    // |24h 涨跌幅| 仅在波动率规则启用时拉一次（权重 80，只发生在换仓日）
+                    let volat: BTreeMap<String, f64> =
+                        if cfg.risk.enabled && cfg.risk.max_volatility > 0.0 {
+                            match client.fetch_ticker_24h().await {
+                                Ok(qs) => qs
+                                    .into_iter()
+                                    .map(|q| (q.symbol, q.price_change_pct.abs() / 100.0))
+                                    .collect(),
+                                Err(e) => {
+                                    warn!("24h 涨跌幅查询失败，本轮跳过波动率规则: {e}");
+                                    BTreeMap::new()
+                                }
+                            }
+                        } else {
+                            BTreeMap::new()
+                        };
+
+                    // 品种级：黑名单 / 极端涨跌幅
+                    let mut kept: Vec<(String, f64, f64, f64)> = Vec::new();
+                    let mut skipped: Vec<String> = Vec::new();
+                    for (sym, price, step, min_qty) in quotes {
+                        let reasons = risk::gate_symbol(&cfg.risk, &sym, volat.get(&sym).copied());
+                        if reasons.is_empty() {
+                            kept.push((sym, price, step, min_qty));
+                        } else {
+                            skipped.push(format!("{sym}: {}", reasons.join("；")));
+                        }
+                    }
+                    if !skipped.is_empty() {
+                        let msg = format!(
+                            "风控拦截 {} 个目标品种: {}",
+                            skipped.len(),
+                            skipped.join(" | ")
+                        );
+                        warn!("🛡️ {msg}");
+                        notify.send(&format!("[quantkit 实盘] 🛡️ {msg}")).await;
+                    }
+
+                    // 订单级：按放行品种分配额度后，查单笔价值/总敞口/品种数量
+                    if kept.is_empty() {
+                        Vec::new()
+                    } else {
+                        let bal = match client.fetch_usdt_balance().await {
+                            Ok(b) => b,
+                            Err(e) => return Err(format!("余额查询失败: {e}")),
+                        };
+                        // 预留约 0.2% 余量（单边手续费 + 市价成交价可能高于最新价），再按品种数均分
+                        let per = bal * 0.998 / kept.len() as f64;
+                        let mut buys = Vec::new();
+                        for (sym, price, step, min_qty) in kept {
+                            let qty = round_step(per / price, step);
+                            let reasons = risk::gate_order(&cfg.risk, &gate_ctx, &sym, price, qty);
+                            if !reasons.is_empty() {
+                                let msg = format!("风控拦截 {sym} 订单: {}", reasons.join("；"));
+                                warn!("🛡️ {msg}");
+                                notify.send(&format!("[quantkit 实盘] 🛡️ {msg}")).await;
+                                continue;
+                            }
+                            buys.push((sym, price, qty, min_qty));
+                        }
+                        buys
+                    }
+                }
+            };
+
+            // 3b-iii) 放行品种下单
+            for (sym, price, qty, min_qty) in &buys {
+                if *qty >= *min_qty && *price > 0.0 {
                     let buy_id = format!("qk_{}_{}_B", last_bar_ts, sym);
                     let reason = "信号调仓：买入新目标品种";
-                    let exec = match client.place_order_with_meta(&Order::market_buy(sym, qty), Some(&buy_id)).await {
+                    let exec = match client.place_order_with_meta(&Order::market_buy(sym, *qty), Some(&buy_id)).await {
                         Ok(x) => x,
                         Err(e) => {
                             let msg = format!("买入 {sym} 失败: {e}");

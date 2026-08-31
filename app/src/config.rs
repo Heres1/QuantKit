@@ -1,5 +1,7 @@
 //! TOML 配置（所有字段带默认值，缺文件即用默认）
 
+use std::collections::BTreeMap;
+
 use quantkit_core::interval::Interval;
 use serde::Deserialize;
 
@@ -130,6 +132,91 @@ fn default_ws_only_closed_bars() -> bool {
     true
 }
 
+fn default_risk_enabled() -> bool {
+    true
+}
+fn default_risk_max_order_value() -> f64 {
+    500.0
+}
+fn default_risk_max_daily_trades() -> u32 {
+    8
+}
+fn default_risk_max_drawdown() -> f64 {
+    0.25
+}
+fn default_risk_drawdown_window_days() -> u64 {
+    30
+}
+fn default_risk_max_volatility() -> f64 {
+    0.25
+}
+fn default_risk_max_consecutive_losses() -> u32 {
+    4
+}
+fn default_risk_loss_cooldown_days() -> u64 {
+    7
+}
+fn default_risk_max_total_exposure() -> f64 {
+    0.0
+}
+
+/// 风控闸门配置（`[risk]` 段）。所有阈值 0/空 = 停用该条规则；
+/// 拦的是「开新仓」，永不拦卖出回笼资金。缺省值按小资金现货账户调校。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RiskConfig {
+    /// 总开关：默认开启；异常时可整体关停而不回滚代码
+    #[serde(default = "default_risk_enabled")]
+    pub enabled: bool,
+    /// 单笔订单名义价值上限（USDT）；0 = 停用
+    #[serde(default = "default_risk_max_order_value")]
+    pub max_order_value: f64,
+    /// 单日（UTC）最大成交笔数；0 = 停用
+    #[serde(default = "default_risk_max_daily_trades")]
+    pub max_daily_trades: u32,
+    /// 禁止买入的品种列表
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+    /// 权益自窗口内峰值回撤达该值（0-1）时禁止开新仓；0 = 停用
+    #[serde(default = "default_risk_max_drawdown")]
+    pub max_drawdown: f64,
+    /// 回撤计算的回看窗口（天）：峰值随窗口前滚，冷却可自愈
+    #[serde(default = "default_risk_drawdown_window_days")]
+    pub drawdown_window_days: u64,
+    /// 买入时 |24h 涨跌幅| 超过该值（0-1）则跳过（不追极端行情）；0 = 停用
+    #[serde(default = "default_risk_max_volatility")]
+    pub max_volatility: f64,
+    /// 连续亏损回合数达该值时禁止开新仓；0 = 停用
+    #[serde(default = "default_risk_max_consecutive_losses")]
+    pub max_consecutive_losses: u32,
+    /// 连续亏损触发后的冷却天数（到期自动恢复开仓）
+    #[serde(default = "default_risk_loss_cooldown_days")]
+    pub loss_cooldown_days: u64,
+    /// 总持仓市值上限（USDT）；0 = 停用（现货无杠杆，敞口天然 ≤ 总资产）
+    #[serde(default = "default_risk_max_total_exposure")]
+    pub max_total_exposure: f64,
+    /// 单品种最大持仓数量（未列出的品种 = 停用该条）
+    #[serde(default)]
+    pub max_position_qty: BTreeMap<String, f64>,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_risk_enabled(),
+            max_order_value: default_risk_max_order_value(),
+            max_daily_trades: default_risk_max_daily_trades(),
+            blacklist: Vec::new(),
+            max_drawdown: default_risk_max_drawdown(),
+            drawdown_window_days: default_risk_drawdown_window_days(),
+            max_volatility: default_risk_max_volatility(),
+            max_consecutive_losses: default_risk_max_consecutive_losses(),
+            loss_cooldown_days: default_risk_loss_cooldown_days(),
+            max_total_exposure: default_risk_max_total_exposure(),
+            max_position_qty: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_data_dir")]
@@ -247,6 +334,9 @@ pub struct AppConfig {
     /// WebSocket 只接收已闭合的 K线（避免未完结数据干扰决策）
     #[serde(default = "default_ws_only_closed_bars")]
     pub ws_only_closed_bars: bool,
+    /// 风控闸门（`[risk]` 段；整段缺省时全部用默认阈值）
+    #[serde(default)]
+    pub risk: RiskConfig,
 }
 
 impl Default for AppConfig {
@@ -292,6 +382,7 @@ impl Default for AppConfig {
             binance: BinanceKeys::default(),
             ws_enabled: default_ws_enabled(),
             ws_only_closed_bars: default_ws_only_closed_bars(),
+            risk: RiskConfig::default(),
         }
     }
 }
