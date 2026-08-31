@@ -1,11 +1,14 @@
 #!/bin/bash
 # QuantKit 统一部署脚本
-# 用途: 把最新代码同步到服务器，编译并重启 quantkit-web
+# 用途: 把最新代码同步到服务器，编译并重启 quantkit-web，然后重启实盘接管原有状态
 # 用法:
-#   ./scripts/deploy.sh           # 同步代码 + 编译 + 重启后端
-#   ./scripts/deploy.sh --live    # 同上，并在重启后启动实盘
+#   ./scripts/deploy.sh            # 同步代码 + 编译 + 重启后端 + 重启实盘
+#   ./scripts/deploy.sh --no-live  # 同上，但不启动实盘（仅在你刻意要停盘时用）
 #
-# 前提: 已配置 SSH 密钥免密登录（见 scripts/setup-remote.sh）
+# 实盘状态接管: 持仓/成交/权益存于服务器 live_quantkit_state.json，
+# 重启后自动恢复并与交易所对账；调仓周期/止损峰值由历史重放确定性重建，无需人工干预。
+#
+# 前提: 已配置 SSH 密钥免密登录（一次性操作: ssh-copy-id ubuntu@43.154.120.27）
 
 set -e
 set -o pipefail
@@ -15,10 +18,10 @@ SERVER_HOST="${QUANTKIT_SERVER_HOST:-43.154.120.27}"
 SERVER="$SERVER_USER@$SERVER_HOST"
 REMOTE_DIR="~/quantkit"
 WEB_PORT="${QUANTKIT_WEB_PORT:-8080}"
-START_LIVE=false
+START_LIVE=true
 
-if [ "$1" = "--live" ]; then
-    START_LIVE=true
+if [ "$1" = "--no-live" ]; then
+    START_LIVE=false
 fi
 
 GREEN='\033[0;32m'
@@ -59,13 +62,17 @@ info "在服务器上编译 release（可能需要几分钟）..."
 ssh "$SERVER" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && cargo build --release --bin quantkit --bin quantkit-web 2>&1 | tail -5"
 
 # 4. 重启 quantkit-web（保留服务器已有的 QUANTKIT_API_TOKEN 环境变量文件）
+# 先杀实盘子进程再杀 web：实盘由 web 以 `quantkit live` 子进程方式托管，
+# 只杀 web 会让实盘变成孤儿进程继续下单，重启后再启动就出现双实盘。
+# [q] 括号写法避免 pkill 的模式字符串匹配到 ssh 会话自身的命令行。
 info "重启 quantkit-web (端口 $WEB_PORT)..."
 ssh "$SERVER" << EOF
 set -e
 source \$HOME/.cargo/env 2>/dev/null
 cd $REMOTE_DIR
 if [ -f .env.server ]; then . ./.env.server; fi
-pkill -f quantkit-web || true
+pkill -f "[q]uantkit live" || true
+pkill -f "[q]uantkit-web" || true
 sleep 2
 mkdir -p logs
 nohup ./target/release/quantkit-web --port $WEB_PORT > /tmp/quantkit-web.log 2>&1 &
@@ -81,21 +88,33 @@ else
     exit 1
 fi
 
-# 6. 可选: 启动实盘
+# 6. 重启实盘（默认行为）：从状态文件接管原持仓，与交易所对账后继续运行
 if [ "$START_LIVE" = true ]; then
-    info "启动实盘..."
+    info "启动实盘（自动接管重启前的持仓与成交记录）..."
     TOKEN=$(ssh "$SERVER" 'cd ~/quantkit && { . ./.env.server 2>/dev/null; echo "${QUANTKIT_API_TOKEN:-}"; }')
     if [ -z "$TOKEN" ]; then
         error "服务器未设置 QUANTKIT_API_TOKEN（写入 ~/quantkit/.env.server），无法启动实盘"
         exit 1
     fi
     RESP=$(ssh "$SERVER" "curl -s -X POST -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/live/start")
-    if echo "$RESP" | grep -q '"ok":true'; then
-        info "✅ 实盘已启动: $RESP"
-    else
+    if ! echo "$RESP" | grep -q '"ok":true'; then
         error "实盘启动失败: $RESP"
         exit 1
     fi
+    info "✅ 实盘已启动: $RESP"
+
+    # 验证状态接管：等待自检+对账完成，检查日志中的恢复记录
+    sleep 8
+    LOGS=$(ssh "$SERVER" "curl -s -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/live/logs")
+    if echo "$LOGS" | grep -q "恢复状态"; then
+        info "✅ 状态接管成功: $(echo "$LOGS" | grep -o '恢复状态[^"]*' | head -1)"
+    elif echo "$LOGS" | grep -q "自检"; then
+        warn "实盘已进入自检，未检测到历史状态（可能是首次启动，无历史可接管）"
+    else
+        warn "暂未读到实盘日志，请手动确认: ./scripts/check-live.sh"
+    fi
+else
+    warn "已跳过实盘启动（--no-live）"
 fi
 
 echo ""

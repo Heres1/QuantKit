@@ -32,14 +32,21 @@
 ## 3. 日常部署（推荐方式）
 
 ```bash
-./scripts/deploy.sh           # 同步代码 + 编译 + 重启后端
-./scripts/deploy.sh --live    # 同上，并启动实盘
-./scripts/check-live.sh       # 检查实盘状态
+./scripts/deploy.sh             # 同步代码 + 编译 + 重启后端 + 重启实盘（接管原状态）
+./scripts/deploy.sh --no-live   # 同上，但不启动实盘（仅刻意停盘时用）
+./scripts/check-live.sh         # 检查实盘状态
 ```
 
 `deploy.sh` 优先走 git（`server` 远程），否则用 rsync 同步；
-然后在服务器上 `cargo build --release` 并重启 quantkit-web。
-部署与实盘启动分离：普通代码推送不会自动重启实盘，只有 `--live` 或手动调用 API 才会启动。
+然后在服务器上 `cargo build --release`、重启 quantkit-web、重启实盘。
+
+**实盘重启的状态接管机制**（重启不中断策略连续性）：
+
+- 持仓、成交流水、权益曲线、最后处理的 bar 持久化在服务器 `~/quantkit/live_quantkit_state.json`，启动时自动加载
+- 启动对账：本地状态与交易所真实余额逐项比对，漂移告警（`live_auto_heal = true` 时自愈）
+- 调仓周期锚点与追踪止损峰值**不需要**持久化：实盘每轮用最近 2000 根 K 线重放历史确定性地重建目标持仓，重启前后结果一致
+- `last_bar_ts` + 幂等订单 ID（bar+品种+方向）保证重启不重复下单
+- 部署脚本会先杀实盘子进程再杀 web，避免孤儿实盘与重启后的新实盘双跑
 
 **远程仓库结构（两个远程）：**
 

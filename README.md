@@ -305,7 +305,7 @@ web_port = 8080             # WebUI 监听端口（quantkit serve）
 5. 日志完整可追溯：每笔真实成交打印品种/数量/价格/手续费，累计成交数与持仓每轮输出；也可经 WebUI「模拟·实盘」页启停并实时查看日志。
 6. 告警通知：配置 `telegram_bot_token` + `telegram_chat_id` 后，实盘启动/每笔真实成交（含卖出）/下单失败/对账漂移/整轮失败都会推送 Telegram；未配置时不影响任何交易逻辑。通知为旁路（5s 超时），失败只告警不阻断。
 7. 实盘监控（WebUI「模拟·实盘」页）：实时持仓盯市（最新价/市值/浮动盈亏）、总资产权益曲线（实盘进程每轮写入快照）、今日盈亏、成交流水（含信号原因）；数据读自 `live_{state_file}`，实盘进程不在线也可查看。对应接口 `/api/live/positions|equity|fills`（`X-API-Token` 保护，含资金信息）。
-8. 服务器部署与代码同步：`scripts/deploy.sh` 一键部署（同步+编译+重启，`--live` 附带启动实盘），`scripts/check-live.sh` 检查状态；详见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+8. 服务器部署与代码同步：`scripts/deploy.sh` 一键部署（同步+编译+重启+自动重启实盘接管原状态，`--no-live` 可跳过实盘），`scripts/check-live.sh` 检查状态；详见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 ## Web 平台（前后端分离）
 
