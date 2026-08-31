@@ -19,6 +19,7 @@ import type {
   LiveOpenOrders,
   LiveOverview,
   MarketRegime,
+  PanicResult,
   Quote,
   StrongCoinsResponse,
   SweepRow,
@@ -211,4 +212,13 @@ export const api = {
   liveOpenOrders: () => request<LiveOpenOrders>("/api/live/open-orders"),
   /** 实盘绩效：轮次配对净利润/胜率/回撤（需 Token） */
   liveAnalysis: () => request<LiveAnalysis>("/api/live/analysis"),
+  /** 一键急停：停实盘进程 + 撤池内挂单 + 市价清仓全部持仓（需 Token；confirm 由客户端固定携带，防误触） */
+  livePanic: () =>
+    request<PanicResult>("/api/live/panic", {
+      method: "POST",
+      body: JSON.stringify({ confirm: "急停" }),
+    }),
+  /** Telegram 测试通知：验证通知链路是否打通（需 Token） */
+  notifyTest: () =>
+    request<{ sent: boolean; message: string }>("/api/notify/test", { method: "POST" }),
 };

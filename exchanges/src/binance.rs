@@ -274,6 +274,15 @@ pub fn parse_my_trades(v: &Value) -> Result<Vec<MyTrade>, BinanceError> {
     Ok(out)
 }
 
+/// 解析 DELETE /api/v3/openOrders 响应（纯函数，可单测）：
+/// 返回被撤销订单的 orderId 列表。响应为被撤订单对象数组（无单时为空数组）。
+pub fn parse_canceled_order_ids(v: &Value) -> Result<Vec<u64>, BinanceError> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| BinanceError::Parse("撤单响应不是数组".into()))?;
+    Ok(arr.iter().map(|row| int_field(row, "orderId")).collect())
+}
+
 /// 解析 /api/v3/openOrders 响应（纯函数，可单测）
 pub fn parse_open_orders(v: &Value) -> Result<Vec<OpenOrder>, BinanceError> {
     let arr = v
@@ -596,6 +605,22 @@ impl BinanceClient {
         parse_open_orders(&v)
     }
 
+    /// 撤销某品种全部在途挂单（含 OCO 两腿），返回被撤订单的 orderId。
+    /// 该品种无挂单时（-2011）视为撤 0 笔成功返回，调用方可无条件调用。
+    pub async fn cancel_open_orders(&self, symbol: &str) -> Result<Vec<u64>, BinanceError> {
+        let mut params = BTreeMap::new();
+        params.insert("symbol".into(), symbol.to_string());
+        let v = match self
+            .signed_request(reqwest::Method::DELETE, "/api/v3/openOrders", &params)
+            .await
+        {
+            Ok(v) => v,
+            Err(BinanceError::Api { code: -2011, .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        parse_canceled_order_ids(&v)
+    }
+
     /// 全部非零余额（资产 -> (free, locked)）。
     /// 对账与权益快照用总额（挂单锁定的部分仍是自己的资产）；
     /// 卖出钳制请用 [`fetch_balances`]（只有可用余额卖得出）。
@@ -773,6 +798,15 @@ impl BinanceClient {
         path: &str,
         extra: &BTreeMap<String, String>,
     ) -> Result<Value, BinanceError> {
+        self.signed_request(reqwest::Method::GET, path, extra).await
+    }
+
+    async fn signed_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        extra: &BTreeMap<String, String>,
+    ) -> Result<Value, BinanceError> {
         let (key, secret) = self.credentials()?;
         let mut params = extra.clone();
         params.insert("timestamp".into(), now_ms().to_string());
@@ -783,7 +817,13 @@ impl BinanceClient {
         let mut last_err = BinanceError::Network("未发起请求".into());
         for attempt in 0..=self.max_retries {
             self.rate.acquire().await;
-            match self.http.get(&url).header("X-MBX-APIKEY", key).send().await {
+            match self
+                .http
+                .request(method.clone(), &url)
+                .header("X-MBX-APIKEY", key)
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
@@ -1066,6 +1106,21 @@ mod tests {
         assert_eq!(os[1].symbol, "");
         assert_eq!(os[1].status, "");
         assert!(parse_open_orders(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn test_parse_canceled_order_ids() {
+        let v: Value = serde_json::from_str(
+            r#"[{"symbol":"LINKUSDT","orderId":7972313177,"status":"CANCELED"},
+                {"orderId":123}]"#,
+        )
+        .unwrap();
+        let ids = parse_canceled_order_ids(&v).unwrap();
+        assert_eq!(ids, vec![7972313177, 123]);
+        // 无挂单时交易所返回空数组
+        let empty: Value = serde_json::from_str("[]").unwrap();
+        assert!(parse_canceled_order_ids(&empty).unwrap().is_empty());
+        assert!(parse_canceled_order_ids(&Value::Null).is_err());
     }
 
     #[test]

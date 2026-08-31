@@ -15,6 +15,7 @@ import type {
   LiveFillRow,
   LiveOpenOrderRow,
   LiveOverview,
+  PanicResult,
   RunInfo,
 } from "../types";
 
@@ -785,6 +786,119 @@ function AccountAssets() {
   );
 }
 
+/** 一键急停确认对话框：说明影响 → 勾选确认 → 执行 → 展示结果摘要 */
+function PanicDialog({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const [ack, setAck] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<PanicResult | null>(null);
+  const [err, setErr] = useState("");
+
+  const run = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      setResult(await api.livePanic());
+      onDone();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={busy ? undefined : onClose}>
+      <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+        <h2 style={{ marginTop: 0, color: "#ef5350" }}>🛑 一键急停</h2>
+        {!result ? (
+          <>
+            <p>
+              执行后将 <b>立即</b>：
+            </p>
+            <ol style={{ lineHeight: 1.9, paddingLeft: 22 }}>
+              <li>停止实盘策略进程（不再产生新下单）</li>
+              <li>撤销池内品种全部在途挂单（释放冻结资金）</li>
+              <li>市价卖出池内全部持仓，回笼为 USDT</li>
+            </ol>
+            <p className="muted">
+              市价成交按实时价格、产生 taker 手续费；操作不可撤销。之后若想继续交易，需手动重新启动实盘。
+            </p>
+            {err && <p style={{ color: "#ef5350" }}>{err}</p>}
+            <label style={{ display: "flex", gap: 8, alignItems: "center", margin: "14px 0" }}>
+              <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
+              我已知晓上述影响，确认执行
+            </label>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button onClick={onClose} disabled={busy}>
+                取消
+              </button>
+              <button className="danger" onClick={run} disabled={!ack || busy}>
+                {busy ? "执行中..." : "确认急停"}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p>
+              已执行：进程{result.stopped_process ? `已停止 (pid=${result.stopped_process})` : "未在运行"}
+              ，撤单 {result.cancelled_orders.length} 笔，市价卖出 {result.sold.length} 个品种
+              {result.failed.length > 0 ? `，${result.failed.length} 个失败` : ""}。
+            </p>
+            {result.sold.length > 0 && (
+              <table>
+                <thead>
+                  <tr>
+                    <th>品种</th>
+                    <th>卖出数量</th>
+                    <th>成交价</th>
+                    <th>手续费</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.sold.map((s) => (
+                    <tr key={s.symbol}>
+                      <td>{s.symbol}</td>
+                      <td>{s.quantity}</td>
+                      <td>{fmtPrice(s.price)}</td>
+                      <td>{fmtNum(s.fee)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {result.failed.length > 0 && (
+              <div style={{ color: "#ef5350", marginTop: 10 }}>
+                {result.failed.map((f) => (
+                  <div key={f.symbol}>
+                    {f.symbol} 卖出失败：{f.error}
+                  </div>
+                ))}
+              </div>
+            )}
+            {result.notes.length > 0 && (
+              <div className="muted" style={{ marginTop: 10 }}>
+                {result.notes.map((n, i) => (
+                  <div key={i}>{n}</div>
+                ))}
+              </div>
+            )}
+            {result.positions_left > 0 && (
+              <p style={{ color: "#ef5350" }}>
+                仍有 {result.positions_left} 条持仓记录未清（卖出失败或交易所仍有余额），请人工核对！
+              </p>
+            )}
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="primary" onClick={onClose}>
+                关闭
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** 实盘监控面板：读后端三接口（状态文件 + 盯市），10s 轮询。
  * 实盘进程不在线也能读（数据在状态文件）；未运行过实盘时只显示提示。 */
 function LiveMonitor() {
@@ -794,6 +908,7 @@ function LiveMonitor() {
   const [fillTotal, setFillTotal] = useState(0);
   const [orders, setOrders] = useState<LiveOpenOrderRow[]>([]);
   const [err, setErr] = useState("");
+  const [panicOpen, setPanicOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -850,7 +965,16 @@ function LiveMonitor() {
         <div className="toolbar">
           <h2 style={{ margin: 0 }}>实盘监控</h2>
           <span className="muted">数据更新于 {fmtDateTime(ov.updated_at_ms)}（10s 自动刷新）</span>
+          <button
+            className="danger small"
+            style={{ marginLeft: "auto" }}
+            onClick={() => setPanicOpen(true)}
+            title="停止策略进程 + 撤销挂单 + 市价清仓全部持仓"
+          >
+            🛑 一键急停
+          </button>
         </div>
+        {panicOpen && <PanicDialog onClose={() => setPanicOpen(false)} onDone={load} />}
         <div className="grid">
           <div className="stat">
             <div className="k">总资产</div>

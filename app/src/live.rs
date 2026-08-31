@@ -95,7 +95,7 @@ pub struct ReconReport {
 }
 
 /// 从交易对提取本位资产（BTCUSDT -> BTC；非 USDT 对原样返回）
-fn base_of(sym: &str) -> &str {
+pub fn base_of(sym: &str) -> &str {
     sym.strip_suffix("USDT").filter(|s| !s.is_empty()).unwrap_or(sym)
 }
 
@@ -1000,7 +1000,8 @@ async fn snapshot_equity(client: &mut BinanceClient, st: &mut LiveState) -> bool
     true
 }
 
-fn load_state(path: &Path) -> Option<LiveState> {
+/// 读取状态文件；不存在返回 None，损坏告警并返回 None（web 急停同样复用此语义）
+pub fn load_state(path: &Path) -> Option<LiveState> {
     let s = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str(&s) {
         Ok(st) => Some(st),
@@ -1011,7 +1012,8 @@ fn load_state(path: &Path) -> Option<LiveState> {
     }
 }
 
-fn save_state_atomic(path: &Path, st: &LiveState) -> Result<(), std::io::Error> {
+/// 原子写状态文件（先写 .tmp 再 rename，避免半截文件）
+pub fn save_state_atomic(path: &Path, st: &LiveState) -> Result<(), std::io::Error> {
     let json = serde_json::to_string_pretty(st).expect("状态序列化");
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;

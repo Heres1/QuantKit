@@ -25,9 +25,12 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use quantkit_app::config::{resolve_binance_keys, AppConfig};
-use quantkit_app::live::{EquitySnap, LiveFill, LiveState};
-use quantkit_core::types::{Kline, Side};
-use quantkit_exchanges::binance::{now_ms, BinanceClient, TickerQuote};
+use quantkit_app::live::{
+    base_of, load_state, save_state_atomic, EquitySnap, LiveFill, LiveState,
+};
+use quantkit_app::notify::Notifier;
+use quantkit_core::types::{Kline, Order, Side};
+use quantkit_exchanges::binance::{now_ms, round_step, BinanceClient, TickerQuote};
 use quantkit_exchanges::traits::MarketData;
 
 use crate::factors;
@@ -57,6 +60,8 @@ struct AppState {
     open_orders: Mutex<Option<(u64, serde_json::Value)>>,
     /// 市场环境分析缓存：(生成时刻, 响应)。基于本地日K+实时价，60s 复用避免重复扫盘/拉行情
     regime: Mutex<Option<(u64, serde_json::Value)>>,
+    /// 一键急停执行锁：true = 正在执行，拒绝并发触发（急停动真实资金，必须串行）
+    panic: Mutex<bool>,
     /// 当前部署的代码版本（启动时探测）：短哈希，工作区有改动时带 -dirty 后缀
     git_commit: String,
 }
@@ -152,6 +157,7 @@ pub async fn serve(cfg: AppConfig) {
         account: Mutex::new(None),
         open_orders: Mutex::new(None),
         regime: Mutex::new(None),
+        panic: Mutex::new(false),
         git_commit,
         cfg,
     });
@@ -165,6 +171,8 @@ pub async fn serve(cfg: AppConfig) {
         .route("/api/download", post(api_download))
         .route("/api/runs/:kind/start", post(api_run_start))
         .route("/api/runs/:kind/stop", post(api_run_stop))
+        .route("/api/live/panic", post(api_live_panic))
+        .route("/api/notify/test", post(api_notify_test))
         // 实盘监控（含持仓/资金信息，属敏感数据，纳入 Token 门禁）
         .route("/api/live/positions", get(api_live_positions))
         .route("/api/live/equity", get(api_live_equity))
@@ -1661,6 +1669,205 @@ async fn api_run_stop(State(st): State<Arc<AppState>>, AxPath(kind): AxPath<Stri
             push_log(&st, format!("[{kind}] 已停止 (pid={pid})")).await;
             ok_json(serde_json::json!({ "stopped": kind, "pid": pid }))
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct PanicReq {
+    #[serde(default)]
+    confirm: String,
+}
+
+/// 一键急停：停止实盘进程 → 撤销池内全部挂单 → 市价清仓池内全部持仓 → 状态清零。
+/// 防误触两道关：请求体必须携带 confirm="急停"；全程独占执行锁拒绝并发触发。
+async fn api_live_panic(State(st): State<Arc<AppState>>, body: Option<Json<PanicReq>>) -> Resp {
+    let confirm = body.map(|b| b.0.confirm).unwrap_or_default();
+    if confirm.trim() != "急停" {
+        return err_resp("二次确认失败：需提交 confirm=\"急停\"（前端急停按钮会自动携带）".into());
+    }
+    let mut lock = st.panic.lock().await;
+    if *lock {
+        return err_resp("急停正在执行中，请勿重复触发".into());
+    }
+    *lock = true;
+    let r = run_panic(&st).await;
+    *lock = false;
+    match r {
+        Ok(out) => ok_json(out),
+        Err(e) => err_resp(e),
+    }
+}
+
+/// 急停执行链（串行）：停进程 → 撤挂单 → 市价清仓 → 清状态，返回执行摘要。
+/// 卖出以交易所真实可用余额为准（而非状态记录），即使状态漂移也能清干净。
+async fn run_panic(st: &AppState) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+
+    // 1) 先停实盘进程：避免清仓时与正在执行的调仓周期冲突
+    let stopped_pid = {
+        let mut guard = st.live.lock().await;
+        match guard.as_mut() {
+            None => None,
+            Some(h) => {
+                let pid = h.pid;
+                let _ = h.child.kill().await;
+                let _ = h.child.wait().await;
+                *guard = None;
+                Some(pid)
+            }
+        }
+    };
+    push_log(
+        st,
+        match stopped_pid {
+            Some(pid) => format!("[live] 急停：已停止实盘进程 (pid={pid})"),
+            None => "[live] 急停：实盘进程未在运行，直接清仓".to_string(),
+        },
+    )
+    .await;
+
+    // 2) 签名客户端（密钥取环境变量或配置文件 [binance] 段）
+    let (key, secret) = resolve_binance_keys(&st.cfg);
+    let (Some(key), Some(secret)) = (key, secret) else {
+        return Err("未配置 Binance 密钥（环境变量或 quantkit.toml [binance] 段），无法执行清仓".into());
+    };
+    let mut client = BinanceClient::with_credentials(Some(key), Some(secret));
+
+    // 3) 撤销池内品种在途挂单：释放锁定余额，避免手动限价单干扰清仓
+    let mut cancelled: Vec<u64> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    match client.fetch_open_orders(None).await {
+        Ok(open) => {
+            for sym in &st.cfg.symbols {
+                if !open.iter().any(|o| &o.symbol == sym) {
+                    continue;
+                }
+                match client.cancel_open_orders(sym).await {
+                    Ok(ids) => cancelled.extend(ids),
+                    Err(e) => notes.push(format!("{sym} 撤单失败: {e}")),
+                }
+            }
+        }
+        Err(e) => notes.push(format!("挂单查询失败（跳过撤单步骤）: {e}")),
+    }
+
+    // 4) 按真实可用余额市价清仓全部池内品种（灰尘跳过；单品种失败不阻断其余）
+    let state_path = PathBuf::from(&st.cfg.state_file)
+        .with_file_name(format!("live_{}", st.cfg.state_file));
+    let mut state = load_state(&state_path).unwrap_or_default();
+    let balances = client
+        .fetch_balances()
+        .await
+        .map_err(|e| format!("余额查询失败: {e}"))?;
+    let mut sold: Vec<serde_json::Value> = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    let ts0 = now_ms();
+    for sym in &st.cfg.symbols {
+        let avail = balances.get(base_of(sym)).copied().unwrap_or(0.0);
+        if avail <= 0.0 {
+            continue;
+        }
+        let (step, min_qty) = match client.fetch_step_size(sym).await {
+            Ok(v) => v,
+            Err(e) => {
+                notes.push(format!("{sym} 精度查询失败，跳过: {e}"));
+                failed.push(json!({ "symbol": sym, "error": format!("精度查询失败: {e}") }));
+                continue;
+            }
+        };
+        let qty = round_step(avail, step);
+        if qty <= 0.0 || qty < min_qty {
+            notes.push(format!("{sym} 余额 {avail:.8} 低于最小下单量，视为灰尘跳过"));
+            continue;
+        }
+        // clientOrderId 带时间戳：重复触发急停不会与旧订单撞 ID
+        let order_id = format!("qk_panic_{sym}_{ts0}");
+        match client
+            .place_order_with_meta(&Order::market_sell(sym, qty), Some(&order_id))
+            .await
+        {
+            Ok(exec) => {
+                // 登记自有订单并推进水印：急停自卖的单下次启动同步时不会被误记为"场外手动单"
+                state
+                    .own_orders
+                    .entry(sym.clone())
+                    .or_default()
+                    .push((exec.order_id, exec.max_trade_id));
+                let wm = state.trade_watermarks.entry(sym.clone()).or_insert(0);
+                *wm = (*wm).max(exec.max_trade_id);
+                state.fills.push(LiveFill {
+                    ts: exec.fill.timestamp,
+                    symbol: sym.clone(),
+                    side: Side::Sell,
+                    quantity: exec.fill.quantity,
+                    price: exec.fill.price,
+                    fee: exec.fill.fee,
+                    reason: "一键急停清仓".to_string(),
+                });
+                sold.push(json!({
+                    "symbol": sym,
+                    "quantity": exec.fill.quantity,
+                    "price": exec.fill.price,
+                    "fee": exec.fill.fee,
+                }));
+            }
+            Err(e) => {
+                notes.push(format!("卖出 {sym} 失败: {e}"));
+                failed.push(json!({ "symbol": sym, "error": e.to_string() }));
+            }
+        }
+    }
+
+    // 5) 状态清零：已卖出品种移出持仓；卖出失败的保留，留待下次启动对账处理
+    let sold_syms: Vec<&str> = sold.iter().filter_map(|s| s["symbol"].as_str()).collect();
+    state.positions.retain(|p| !sold_syms.contains(&p.symbol.as_str()));
+    state.updated_at_ms = now_ms();
+    save_state_atomic(&state_path, &state).map_err(|e| format!("状态写入失败: {e}"))?;
+    // 失效行情/账户缓存：清仓后余额与挂单已变化，别让 15s 缓存展示旧数据
+    *st.open_orders.lock().await = None;
+    *st.account.lock().await = None;
+
+    // 6) 日志 + Telegram 通知（未配置时 no-op）
+    let summary = format!(
+        "[quantkit 实盘] 🛑 一键急停已执行：进程{}，撤单 {} 笔，市价卖出 {} 个品种{}",
+        stopped_pid
+            .map(|p| format!("已停止(pid={p})"))
+            .unwrap_or_else(|| "未在运行".to_string()),
+        cancelled.len(),
+        sold.len(),
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!("，{} 个失败", failed.len())
+        },
+    );
+    push_log(st, format!("[live] {summary}")).await;
+    Notifier::new(&st.cfg.telegram_bot_token, &st.cfg.telegram_chat_id)
+        .send(&summary)
+        .await;
+
+    Ok(json!({
+        "stopped_process": stopped_pid,
+        "cancelled_orders": cancelled,
+        "sold": sold,
+        "failed": failed,
+        "notes": notes,
+        "positions_left": state.positions.len(),
+    }))
+}
+
+/// Telegram 测试通知：验证配置链路是否打通（返回真实发送结果）
+async fn api_notify_test(State(st): State<Arc<AppState>>) -> Resp {
+    let notify = Notifier::new(&st.cfg.telegram_bot_token, &st.cfg.telegram_chat_id);
+    if !notify.enabled() {
+        return err_resp(
+            "Telegram 未配置：请先在 quantkit.toml 设置 telegram_bot_token 与 telegram_chat_id".into(),
+        );
+    }
+    let msg = format!("[quantkit] 测试通知：链路正常 ✅（{}）", now_str());
+    match notify.try_send(&msg).await {
+        Ok(()) => ok_json(serde_json::json!({ "sent": true, "message": msg })),
+        Err(e) => err_resp(format!("Telegram 发送失败: {e}")),
     }
 }
 

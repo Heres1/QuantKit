@@ -374,6 +374,27 @@ export interface LiveOpenOrders {
   updated_at_ms: number;
 }
 
+/** 一键急停执行摘要（后端 /api/live/panic 返回） */
+export interface PanicSoldRow {
+  symbol: string;
+  quantity: number;
+  price: number;
+  fee: number;
+}
+export interface PanicFailedRow {
+  symbol: string;
+  error: string;
+}
+export interface PanicResult {
+  /** 被停止的实盘进程 pid；进程本未在运行时为 null */
+  stopped_process: number | null;
+  cancelled_orders: number[];
+  sold: PanicSoldRow[];
+  failed: PanicFailedRow[];
+  notes: string[];
+  positions_left: number;
+}
+
 // 市场环境分析（基于本地日K + 实时价，样本 <51 根的品种已剔除）
 export interface RegimeSymbol {
   symbol: string;

@@ -33,17 +33,27 @@ impl Notifier {
         self.token.is_some() && self.chat_id.is_some()
     }
 
-    /// 发送一条文本消息。失败只打印告警（通知是旁路，不是交易链路）。
-    pub async fn send(&self, text: &str) {
+    /// 发送一条文本消息，返回真实发送结果（测试链路等需要知道成败的场景使用）
+    pub async fn try_send(&self, text: &str) -> Result<(), String> {
         let (Some(token), Some(chat_id)) = (&self.token, &self.chat_id) else {
-            return;
+            return Err("未配置 token/chat_id".into());
         };
         let url = format!("https://api.telegram.org/bot{token}/sendMessage");
         let body = serde_json::json!({ "chat_id": chat_id, "text": text });
         match self.http.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => eprintln!("[notify] Telegram 推送失败: HTTP {}", resp.status()),
-            Err(e) => eprintln!("[notify] Telegram 推送失败: {e}"),
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// 发送一条文本消息。失败只打印告警（通知是旁路，不是交易链路）。
+    pub async fn send(&self, text: &str) {
+        if self.token.is_none() || self.chat_id.is_none() {
+            return;
+        }
+        if let Err(e) = self.try_send(text).await {
+            eprintln!("[notify] Telegram 推送失败: {e}");
         }
     }
 }
