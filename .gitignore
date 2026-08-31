@@ -37,6 +37,7 @@ logs/*.log
 # Temporary files
 *.tmp
 *.temp
+*.bak*
 tmp/
 
 # OS files
