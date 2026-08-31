@@ -9,7 +9,7 @@ TOKEN="${QUANTKIT_API_TOKEN:-}"
 
 if [ -z "$TOKEN" ]; then
     # 尝试从服务器 .env.server 读取，免去手动传参
-    TOKEN=$(ssh "$SERVER" 'grep QUANTKIT_API_TOKEN ~/quantkit/.env.server 2>/dev/null | cut -d= -f2 | tr -d "export "' 2>/dev/null)
+    TOKEN=$(ssh "$SERVER" 'cd ~/quantkit && . ./.env.server 2>/dev/null && echo "$QUANTKIT_API_TOKEN"' 2>/dev/null)
 fi
 
 echo "=========================================="
