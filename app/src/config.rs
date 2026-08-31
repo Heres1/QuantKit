@@ -238,6 +238,11 @@ pub struct AppConfig {
     pub interval: String,
     #[serde(default = "default_symbols")]
     pub symbols: Vec<String>,
+    /// 配置文件是否显式定义了 `symbols`（不参与序列化，由 `load_config` 填充）。
+    /// serde 默认值填充无法区分「配置写了」与「取默认」，需要该标志让
+    /// CLI 自动发现只在配置未定义品种时生效，避免覆盖显式配置。
+    #[serde(skip)]
+    pub symbols_from_file: bool,
     /// momentum | trend | ma_cross | grid | dca
     #[serde(default = "default_strategy")]
     pub strategy: String,
@@ -349,6 +354,7 @@ impl Default for AppConfig {
             fill_mode: default_fill_mode(),
             interval: default_interval(),
             symbols: default_symbols(),
+            symbols_from_file: false,
             strategy: default_strategy(),
             ma_cross_fast: default_ma_cross_fast(),
             ma_cross_slow: default_ma_cross_slow(),
@@ -422,17 +428,63 @@ pub fn resolve_binance_keys(cfg: &AppConfig) -> (Option<String>, Option<String>)
     )
 }
 
-/// 从 TOML 文件加载配置；文件不存在或解析失败时使用默认配置
+/// 从 TOML 文件加载配置；文件不存在或解析失败时使用默认配置。
+/// 同时探测文件是否显式定义了 `symbols`（写入 `symbols_from_file`），
+/// 供 CLI 判断能否用目录自动发现覆盖品种池——显式配置优先。
 pub fn load_config(path: Option<&str>) -> AppConfig {
     let path = path.unwrap_or("quantkit.toml");
     match std::fs::read_to_string(path) {
-        Ok(s) => match toml::from_str(&s) {
-            Ok(cfg) => cfg,
+        Ok(s) => match toml::from_str::<AppConfig>(&s) {
+            Ok(mut cfg) => {
+                cfg.symbols_from_file = toml::from_str::<toml::Table>(&s)
+                    .map(|t| t.contains_key("symbols"))
+                    .unwrap_or(false);
+                cfg
+            }
             Err(e) => {
                 eprintln!("配置解析失败({}): {}，使用默认配置", path, e);
                 AppConfig::default()
             }
         },
         Err(_) => AppConfig::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("{}_{}", std::process::id(), name));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_symbols_from_file_true_when_explicit() {
+        let p = write_tmp(
+            "cfg_sym_explicit.toml",
+            "symbols = [\"BTCUSDT\"]\nstrategy = \"trend\"\n",
+        );
+        let cfg = load_config(p.to_str());
+        assert!(cfg.symbols_from_file, "显式定义 symbols 应置 true");
+        assert_eq!(cfg.symbols, vec!["BTCUSDT".to_string()]);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_symbols_from_file_false_when_absent() {
+        let p = write_tmp("cfg_sym_absent.toml", "strategy = \"trend\"\n");
+        let cfg = load_config(p.to_str());
+        assert!(!cfg.symbols_from_file, "未定义 symbols 应保持 false");
+        assert_eq!(cfg.symbols, default_symbols());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_symbols_from_file_false_when_missing_file() {
+        let cfg = load_config(Some("/tmp/__no_such_quantkit_cfg__.toml"));
+        assert!(!cfg.symbols_from_file);
+        assert_eq!(cfg.symbols, default_symbols());
     }
 }

@@ -36,8 +36,10 @@ async fn main() {
     let symbols_explicit = args.iter().any(|a| a == "--symbols");
     // 周期只解析一次，全链路复用（非法值直接退出）
     let interval = apply_cli_overrides(&args, &mut cfg);
-    // CLI 未显式指定品种时，自动发现数据目录下的全部品种（配置文件指定仍生效）
-    if !symbols_explicit && get_arg(&args, "--config").is_none() {
+    // CLI 未显式指定品种、且配置文件也未定义 symbols 时，才自动发现数据目录下的全部品种。
+    // 配置显式定义的品种池优先（此前自动发现会静默覆盖配置，导致 trend 等
+    // 依赖 symbols.first() 的策略交易到错误品种）。
+    if !symbols_explicit && get_arg(&args, "--config").is_none() && !cfg.symbols_from_file {
         match data::discover_symbols(&cfg.data_dir, interval) {
             Ok(found) if !found.is_empty() => cfg.symbols = found,
             _ => {}

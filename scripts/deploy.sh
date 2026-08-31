@@ -72,6 +72,7 @@ source \$HOME/.cargo/env 2>/dev/null
 cd $REMOTE_DIR
 if [ -f .env.server ]; then . ./.env.server; fi
 pkill -f "[q]uantkit live" || true
+pkill -f "[q]uantkit dry-run" || true
 pkill -f "[q]uantkit-web" || true
 sleep 2
 mkdir -p logs
@@ -88,33 +89,46 @@ else
     exit 1
 fi
 
-# 6. 重启实盘（默认行为）：从状态文件接管原持仓，与交易所对账后继续运行
+# 6. 重启运行进程（默认行为）：按服务器 quantkit.toml 的 live_enabled 决定
+#    true  -> 启动实盘（从状态文件接管原持仓，与交易所对账后继续运行）
+#    false -> 启动纸上交易 dryrun（真金不参与，影子账本独立于实盘状态文件）
 if [ "$START_LIVE" = true ]; then
-    info "启动实盘（自动接管重启前的持仓与成交记录）..."
     TOKEN=$(ssh "$SERVER" 'cd ~/quantkit && { . ./.env.server 2>/dev/null; echo "${QUANTKIT_API_TOKEN:-}"; }')
     if [ -z "$TOKEN" ]; then
-        error "服务器未设置 QUANTKIT_API_TOKEN（写入 ~/quantkit/.env.server），无法启动实盘"
+        error "服务器未设置 QUANTKIT_API_TOKEN（写入 ~/quantkit/.env.server），无法启动运行进程"
         exit 1
     fi
-    RESP=$(ssh "$SERVER" "curl -s -X POST -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/live/start")
-    if ! echo "$RESP" | grep -q '"ok":true'; then
-        error "实盘启动失败: $RESP"
-        exit 1
-    fi
-    info "✅ 实盘已启动: $RESP"
+    LIVE_ENABLED=$(ssh "$SERVER" "grep -E '^live_enabled[[:space:]]*=' $REMOTE_DIR/quantkit.toml | head -1 | grep -c true" || true)
+    if [ "$LIVE_ENABLED" = "1" ]; then
+        info "启动实盘（自动接管重启前的持仓与成交记录）..."
+        RESP=$(ssh "$SERVER" "curl -s -X POST -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/live/start")
+        if ! echo "$RESP" | grep -q '"ok":true'; then
+            error "实盘启动失败: $RESP"
+            exit 1
+        fi
+        info "✅ 实盘已启动: $RESP"
 
-    # 验证状态接管：等待自检+对账完成，检查日志中的恢复记录
-    sleep 8
-    LOGS=$(ssh "$SERVER" "curl -s -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/live/logs")
-    if echo "$LOGS" | grep -q "恢复状态"; then
-        info "✅ 状态接管成功: $(echo "$LOGS" | grep -o '恢复状态[^"]*' | head -1)"
-    elif echo "$LOGS" | grep -q "自检"; then
-        warn "实盘已进入自检，未检测到历史状态（可能是首次启动，无历史可接管）"
+        # 验证状态接管：等待自检+对账完成，检查日志中的恢复记录
+        sleep 8
+        LOGS=$(ssh "$SERVER" "curl -s -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/live/logs")
+        if echo "$LOGS" | grep -q "恢复状态"; then
+            info "✅ 状态接管成功: $(echo "$LOGS" | grep -o '恢复状态[^"]*' | head -1)"
+        elif echo "$LOGS" | grep -q "自检"; then
+            warn "实盘已进入自检，未检测到历史状态（可能是首次启动，无历史可接管）"
+        else
+            warn "暂未读到实盘日志，请手动确认: ./scripts/check-live.sh"
+        fi
     else
-        warn "暂未读到实盘日志，请手动确认: ./scripts/check-live.sh"
+        info "live_enabled=false，启动纸上交易 (dryrun)..."
+        RESP=$(ssh "$SERVER" "curl -s -X POST -H 'X-API-Token: $TOKEN' http://localhost:$WEB_PORT/api/runs/dryrun/start")
+        if ! echo "$RESP" | grep -q '"ok":true'; then
+            error "纸上交易启动失败: $RESP"
+            exit 1
+        fi
+        info "✅ 纸上交易已启动: $RESP"
     fi
 else
-    warn "已跳过实盘启动（--no-live）"
+    warn "已跳过运行进程启动（--no-live）"
 fi
 
 echo ""
