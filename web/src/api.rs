@@ -432,7 +432,8 @@ async fn api_markets(State(st): State<Arc<AppState>>) -> Resp {
         Ok(all) => {
             let list: Vec<TickerQuote> = all
                 .into_iter()
-                .filter(|q| q.symbol.ends_with("USDT"))
+                // 剔除已退市品种：交易所 24h 接口仍返回它们但价格/成交额全为 0
+                .filter(|q| q.symbol.ends_with("USDT") && q.last_price > 0.0)
                 .collect();
             *st.markets.lock().await = Some((now, list.clone()));
             ok_json(serde_json::json!({ "quotes": list, "updated_at": now }))
