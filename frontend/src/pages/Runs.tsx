@@ -25,6 +25,23 @@ function pnlColor(v: number | null | undefined): string | undefined {
   return v >= 0 ? "#26a69a" : "#ef5350";
 }
 
+/** 当日盈亏（按浏览器本地日界）：后端 day_pnl 以 UTC 日界计算，
+ * 对东八区用户会跨日错位，这里用权益序列在本地时区重新计算 */
+function localDayChange(series: { ts: number; total: number }[]): { chg: number; pct: number } | null {
+  if (series.length < 2) return null;
+  const dayKey = (ts: number) => {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  };
+  const last = series[series.length - 1];
+  const key = dayKey(last.ts);
+  const start = series.find((s) => dayKey(s.ts) === key);
+  if (!start || start.ts === last.ts) return null;
+  const chg = last.total - start.total;
+  const pct = start.total !== 0 ? chg / start.total : 0;
+  return { chg, pct };
+}
+
 /** 策略中文名：与回测中心下拉选项逐字一致，避免同一策略两页两个叫法 */
 const STRATEGY_LABELS: Record<string, string> = {
   momentum: "动量轮动",
@@ -814,10 +831,13 @@ function LiveMonitor() {
   }
 
   const unrealized = ov.positions.reduce((s, p) => s + (p.pnl ?? 0), 0);
+  // 图表组件内部已做 ms→s 换算，这里保持毫秒原值（此前多除一次 1000，
+  // 导致全部点落到 1970 年、横轴日期错误）
   const curve = (eq?.series ?? []).map((s) => ({
-    timestamp: Math.floor(s.ts / 1000),
+    timestamp: s.ts,
     equity: s.total,
   }));
+  const dayPnl = localDayChange(eq?.series ?? []);
 
   return (
     <>
@@ -833,11 +853,9 @@ function LiveMonitor() {
           </div>
           <div className="stat">
             <div className="k">今日盈亏</div>
-            <div className="v" style={{ color: pnlColor(eq?.day_pnl) }}>
-              {eq?.day_pnl != null
-                ? `${eq.day_pnl >= 0 ? "+" : ""}${fmtNum(eq.day_pnl)}${
-                    eq.day_pnl_pct != null ? `（${(eq.day_pnl_pct * 100).toFixed(2)}%）` : ""
-                  }`
+            <div className="v" style={{ color: pnlColor(dayPnl?.chg) }}>
+              {dayPnl
+                ? `${dayPnl.chg >= 0 ? "+" : ""}${fmtNum(dayPnl.chg)}（${(dayPnl.pct * 100).toFixed(2)}%）`
                 : "-"}
             </div>
           </div>

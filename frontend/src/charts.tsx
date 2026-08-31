@@ -24,6 +24,13 @@ const CHART_OPTS = {
   timeScale: { timeVisible: true, borderColor: "#2a3242" },
 };
 
+// lightweight-charts 一律按 UTC 解释和渲染时间戳；这里把毫秒时间戳换算成
+// “本地墙钟时间对应的伪 UTC”，使坐标轴刻度与十字光标提示显示浏览器本地时间
+// （按每个点各自取偏移，天然兼容夏令时地区）
+function toLocalTime(ms: number): UTCTimestamp {
+  return (Math.floor(ms / 1000) - new Date(ms).getTimezoneOffset() * 60) as UTCTimestamp;
+}
+
 export function CandleChart({ klines, height = 420 }: { klines: Kline[]; height?: number }) {
   const ref = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -53,7 +60,7 @@ export function CandleChart({ klines, height = 420 }: { klines: Kline[]; height?
     if (!s) return;
     s.setData(
       klines.map((k) => ({
-        time: (k.open_time / 1000) as UTCTimestamp,
+        time: toLocalTime(k.open_time),
         open: k.open,
         high: k.high,
         low: k.low,
@@ -73,7 +80,7 @@ function dedupPoints(points: { timestamp: number; value: number }[]): LinePoint[
   const byTime = new Map<number, number>();
   for (const p of points) byTime.set(p.timestamp, p.value);
   return [...byTime.entries()].map(([t, v]) => ({
-    time: (t / 1000) as UTCTimestamp,
+    time: toLocalTime(t),
     value: v,
   }));
 }

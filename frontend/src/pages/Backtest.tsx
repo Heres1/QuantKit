@@ -19,13 +19,14 @@ import type {
 // 对比图配色（按选择顺序循环）
 const PALETTE = ["#5b8def", "#f5a623", "#26a69a", "#ef5350", "#ab47bc", "#8d6e63"];
 
-// 月度收益：按 UTC 月份分组权益曲线，月收益 = 月末/上月末 - 1（首月以曲线首点为基准）
+// 月度收益：按本地月份分组权益曲线（与界面其他日期的本地时区口径一致），
+// 月收益 = 月末/上月末 - 1（首月以曲线首点为基准）
 function monthlyReturns(curve: EquityPoint[]): { year: number; month: number; ret: number }[] {
   const months: { year: number; month: number; last: number }[] = [];
   for (const p of curve) {
     const d = new Date(p.timestamp);
-    const y = d.getUTCFullYear();
-    const mo = d.getUTCMonth();
+    const y = d.getFullYear();
+    const mo = d.getMonth();
     const cur = months[months.length - 1];
     if (!cur || cur.year !== y || cur.month !== mo) {
       months.push({ year: y, month: mo, last: p.equity });

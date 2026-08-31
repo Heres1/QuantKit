@@ -31,12 +31,18 @@ export function fmtVol(v: number): string {
   return v < 0 ? `-${s}` : s;
 }
 
+function pad2(n: number): string {
+  return n.toString().padStart(2, "0");
+}
+
 export function fmtDate(ms: number): string {
   if (!ms) return "-";
-  return new Date(ms).toISOString().slice(0, 10);
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
 export function fmtDateTime(ms: number): string {
   if (!ms) return "-";
-  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+  const d = new Date(ms);
+  return `${fmtDate(ms)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
