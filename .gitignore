@@ -22,6 +22,7 @@ quantkit.toml
 
 # State files (runtime data)
 quantkit_state.json
+quantkit_state.*.json
 live_*.json
 data/*.json
 .quantkit-web.pid
