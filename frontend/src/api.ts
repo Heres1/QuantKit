@@ -25,9 +25,10 @@ import type {
 } from "./types";
 
 // 后端地址：运行时可切换。优先级：设置页保存的地址（localStorage）>
-// 构建时 VITE_API_BASE > 本地默认；避免后端迁移后必须重新构建前端。
+// 构建时 VITE_API_BASE > 默认；避免后端迁移后必须重新构建前端。
+// 默认直连实盘服务器（公网 8080），无需 SSH 隧道；本地调试可在设置页切回"本地"。
 const DEFAULT_API_BASE =
-  (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://127.0.0.1:8080";
+  (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://43.154.120.27:8080";
 
 const API_BASE_KEY = "quantkit_api_base";
 
