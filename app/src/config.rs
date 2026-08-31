@@ -286,6 +286,10 @@ pub struct AppConfig {
     pub trailing_stop_enabled: bool,
     #[serde(default = "default_trailing_stop_pct")]
     pub trailing_stop_pct: f64,
+    /// 逐品种追踪止损覆盖表（TOML: [trailing_stop_by_symbol]）：
+    /// 出现的品种用表内阈值，未出现的沿用 `trailing_stop_pct`
+    #[serde(default)]
+    pub trailing_stop_by_symbol: BTreeMap<String, f64>,
     #[serde(default = "default_cooldown_days")]
     pub cooldown_days: u64,
     /// 持仓品种数：1 = 集中轮动；>1 = 动量前 N 等额分散
@@ -371,6 +375,7 @@ impl Default for AppConfig {
             rebalance_days: default_rebalance_days(),
             trailing_stop_enabled: default_trailing_stop_enabled(),
             trailing_stop_pct: default_trailing_stop_pct(),
+            trailing_stop_by_symbol: BTreeMap::new(),
             cooldown_days: default_cooldown_days(),
             top_n: default_top_n(),
             regime_ma_days: default_regime_ma_days(),
@@ -486,5 +491,26 @@ mod tests {
         let cfg = load_config(Some("/tmp/__no_such_quantkit_cfg__.toml"));
         assert!(!cfg.symbols_from_file);
         assert_eq!(cfg.symbols, default_symbols());
+    }
+
+    #[test]
+    fn test_trailing_stop_by_symbol_parsed() {
+        let p = write_tmp(
+            "cfg_trail_override.toml",
+            "strategy = \"trend\"\n[trailing_stop_by_symbol]\nTRXUSDT = 0.25\nDOGEUSDT = 0.2\n",
+        );
+        let cfg = load_config(p.to_str());
+        assert_eq!(cfg.trailing_stop_by_symbol.len(), 2);
+        assert!((cfg.trailing_stop_by_symbol["TRXUSDT"] - 0.25).abs() < 1e-9);
+        assert!((cfg.trailing_stop_by_symbol["DOGEUSDT"] - 0.2).abs() < 1e-9);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_trailing_stop_by_symbol_defaults_empty() {
+        let p = write_tmp("cfg_trail_absent.toml", "strategy = \"trend\"\n");
+        let cfg = load_config(p.to_str());
+        assert!(cfg.trailing_stop_by_symbol.is_empty());
+        let _ = std::fs::remove_file(p);
     }
 }

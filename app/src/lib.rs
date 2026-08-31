@@ -21,6 +21,7 @@ use quantkit_strategies::dca::Dca;
 use quantkit_strategies::grid::Grid;
 use quantkit_strategies::ma_cross::MaCross;
 use quantkit_strategies::momentum_rotation::MomentumRotation;
+use quantkit_strategies::multi_trailing::MultiTrailingTrend;
 use quantkit_strategies::trailing_trend::TrailingTrend;
 
 /// 按配置构建策略实例（momentum 动量轮动 / trend 趋势追踪 / ma_cross 双均线模板 /
@@ -35,12 +36,35 @@ use quantkit_strategies::trailing_trend::TrailingTrend;
 /// - `ma_cross_fast` / `ma_cross_slow`：按图表惯例即为「根」（4h 上的 MA10 = 10 根 4h），不换算
 pub fn build_strategy(cfg: &AppConfig, interval: Interval) -> Box<dyn Strategy> {
     match cfg.strategy.as_str() {
-        "trend" => Box::new(TrailingTrend::new(
-            cfg.symbols.first().cloned().unwrap_or_else(|| "BTCUSDT".into()),
-            interval.days_to_bars(cfg.ma_days),
-            cfg.trailing_stop_pct,
-            cfg.cooldown_days,
-        )),
+        "trend" => {
+            let ma_bars = interval.days_to_bars(cfg.ma_days);
+            let symbols = if cfg.symbols.is_empty() {
+                vec!["BTCUSDT".to_string()]
+            } else {
+                cfg.symbols.clone()
+            };
+            let trail_for = |s: &str| {
+                cfg.trailing_stop_by_symbol
+                    .get(s)
+                    .copied()
+                    .unwrap_or(cfg.trailing_stop_pct)
+            };
+            if symbols.len() == 1 {
+                Box::new(TrailingTrend::new(
+                    symbols[0].clone(),
+                    ma_bars,
+                    trail_for(&symbols[0]),
+                    cfg.cooldown_days,
+                ))
+            } else {
+                Box::new(MultiTrailingTrend::new(
+                    symbols
+                        .iter()
+                        .map(|s| TrailingTrend::new(s.clone(), ma_bars, trail_for(s), cfg.cooldown_days))
+                        .collect(),
+                ))
+            }
+        }
         "ma_cross" => Box::new(MaCross::new(
             cfg.symbols.clone(),
             cfg.ma_cross_fast,
@@ -164,12 +188,15 @@ mod tests {
 
     #[test]
     fn test_build_strategy_trend() {
+        // 多品种 -> 组合策略
         let mut cfg = test_config();
         cfg.strategy = "trend".to_string();
-        
-        let interval = Interval::H4;
-        let strategy = build_strategy(&cfg, interval);
-        
+        let strategy = build_strategy(&cfg, Interval::H4);
+        assert_eq!(strategy.name(), "multi_trailing_trend");
+
+        // 单品种 -> 裸追踪止损（保持原行为）
+        cfg.symbols = vec!["BTCUSDT".to_string()];
+        let strategy = build_strategy(&cfg, Interval::H4);
         assert_eq!(strategy.name(), "trailing_trend");
     }
 
