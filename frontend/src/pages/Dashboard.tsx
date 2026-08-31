@@ -43,6 +43,12 @@ export default function Dashboard() {
                 <div className="v">{dash.version}</div>
               </div>
               <div className="stat">
+                <div className="k">代码版本</div>
+                <div className="v">
+                  <code>{dash.git_commit ?? "unknown"}</code>
+                </div>
+              </div>
+              <div className="stat">
                 <div className="k">策略</div>
                 <div className="v">{dash.strategy}</div>
               </div>

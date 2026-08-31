@@ -191,6 +191,8 @@ export interface BacktestRecord {
 
 export interface Dashboard {
   version: string;
+  /** 当前部署的代码 git 版本（短哈希，有未提交改动时带 -dirty） */
+  git_commit?: string;
   data_dir: string;
   symbols: string[];
   strategy: string;

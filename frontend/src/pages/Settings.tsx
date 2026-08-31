@@ -33,7 +33,7 @@ export default function Settings() {
       const d = await api.dashboard();
       setTestResult({
         ok: true,
-        msg: `连接成功：${h.name} v${h.version}，缓存品种 ${d.symbols.length} 个`,
+        msg: `连接成功：${h.name} v${h.version}（代码版本 ${d.git_commit ?? "unknown"}），缓存品种 ${d.symbols.length} 个`,
       });
     } catch (e) {
       setTestResult({ ok: false, msg: (e as Error).message });

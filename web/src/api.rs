@@ -55,6 +55,8 @@ struct AppState {
     account: Mutex<Option<(u64, serde_json::Value)>>,
     /// 市场环境分析缓存：(生成时刻, 响应)。基于本地日K+实时价，60s 复用避免重复扫盘/拉行情
     regime: Mutex<Option<(u64, serde_json::Value)>>,
+    /// 当前部署的代码版本（启动时探测）：短哈希，工作区有改动时带 -dirty 后缀
+    git_commit: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -94,15 +96,44 @@ fn fmt_ts(ms: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}")
 }
 
+/// 探测当前部署的代码版本：短哈希；工作区有未提交改动时追加 -dirty。
+/// 非 git 环境（如直接拷贝二进制目录）返回 "unknown"，不影响服务启动
+fn detect_git_version() -> String {
+    let hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match hash {
+        Some(h) => {
+            let dirty = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+            if dirty {
+                format!("{h}-dirty")
+            } else {
+                h
+            }
+        }
+        None => "unknown".to_string(),
+    }
+}
+
 // ---------------- 入口 ----------------
 
 /// 启动 API 服务（阻塞直到进程退出）。监听 0.0.0.0：前后端分离部署，
 /// 前端静态站点独立托管，跨域经 CORS 中间件放开。
 pub async fn serve(cfg: AppConfig) {
     let bin = resolve_cli_bin();
+    let git_commit = detect_git_version();
     let addr = format!("0.0.0.0:{}", cfg.web_port);
     println!(
-        "[web] quantkit API 服务启动: http://{addr}  (CLI: {})",
+        "[web] quantkit API 服务启动: http://{addr}  (CLI: {}, 代码版本: {git_commit})",
         bin.display()
     );
     if std::env::var("QUANTKIT_API_TOKEN").map(|t| t.is_empty()).unwrap_or(true) {
@@ -118,6 +149,7 @@ pub async fn serve(cfg: AppConfig) {
         binance: Arc::new(BinanceClient::public()),
         account: Mutex::new(None),
         regime: Mutex::new(None),
+        git_commit,
         cfg,
     });
 
@@ -365,6 +397,7 @@ async fn api_dashboard(State(st): State<Arc<AppState>>) -> Resp {
     let keys_ok = bk.is_some() && bs.is_some();
     ok_json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "git_commit": st.git_commit,
         "data_dir": cfg.data_dir,
         "symbols": cfg.symbols,
         "strategy": cfg.strategy,
