@@ -489,6 +489,15 @@ pub async fn run(cfg: &AppConfig, interval: Interval) {
         info!("📱 Telegram 通知已启用");
     }
     info!("🛡️ 风控闸门: {}", risk::describe(&cfg.risk));
+    if cfg.circuit_breaker_pct > 0.0 {
+        info!(
+            "🔌 组合回撤熔断: 回撤≥{:.0}% 全清仓并冷却 {} 天",
+            cfg.circuit_breaker_pct * 100.0,
+            cfg.circuit_breaker_cooldown_days
+        );
+    } else {
+        info!("🔌 组合回撤熔断: 未启用（circuit_breaker_pct = 0）");
+    }
 
     // --- 启动自检 ---
     let fee_rate = match preflight(&mut client, cfg).await {
