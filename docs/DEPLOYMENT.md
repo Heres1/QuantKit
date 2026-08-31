@@ -37,9 +37,18 @@
 ./scripts/check-live.sh       # 检查实盘状态
 ```
 
-`deploy.sh` 优先走 git（若已配置指向服务器的远程仓库），否则用 rsync 同步；
+`deploy.sh` 优先走 git（`server` 远程），否则用 rsync 同步；
 然后在服务器上 `cargo build --release` 并重启 quantkit-web。
 部署与实盘启动分离：普通代码推送不会自动重启实盘，只有 `--live` 或手动调用 API 才会启动。
+
+**远程仓库结构（两个远程）：**
+
+| 远程 | 地址 | 用途 |
+|---|---|---|
+| `origin` | `git@github.com:Heres1/QuantKit.git` | GitHub 私有仓库，代码备份与协作 |
+| `server` | `ubuntu@43.154.120.27:repos/quantkit.git` | 部署用裸仓库，push 后经 post-receive 钩子自动同步 `~/quantkit` |
+
+日常流程：本地提交后 `git push`（GitHub 备份）+ `./scripts/deploy.sh`（部署到服务器）。
 
 ## 4. 手动操作参考
 
