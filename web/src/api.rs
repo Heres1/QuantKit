@@ -1767,7 +1767,7 @@ async fn run_panic(st: &AppState) -> Result<serde_json::Value, String> {
         if avail <= 0.0 {
             continue;
         }
-        let (step, min_qty) = match client.fetch_step_size(sym).await {
+        let (step, min_qty, _min_notional) = match client.fetch_step_size(sym).await {
             Ok(v) => v,
             Err(e) => {
                 notes.push(format!("{sym} 精度查询失败，跳过: {e}"));

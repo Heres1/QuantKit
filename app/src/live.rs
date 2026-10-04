@@ -669,8 +669,9 @@ pub async fn run(cfg: &AppConfig, interval: Interval) {
 
     // --- 主循环 ---
     // 状态文件与 dry-run 隔离，避免两种模式互相覆盖
+    let mut dedup = AlertDedup::default();
     loop {
-        if let Err(e) = run_cycle(
+        match run_cycle(
             cfg,
             interval,
             &mut client,
@@ -679,10 +680,26 @@ pub async fn run(cfg: &AppConfig, interval: Interval) {
             fee_rate,
             &notify,
             event_bus.as_ref(), // 传入事件总线
+            &mut dedup,
         ).await {
-            error!("本轮失败（下轮重试）: {e}");
-            // 整轮失败也推送（连续失败时可结合日志排查）
-            notify.send(&format!("[quantkit 实盘] 本轮执行失败（下轮重试）: {e}")).await;
+            Ok(()) => {
+                if let Some(prev) = dedup.cycle_err.take() {
+                    let brief: String = prev.chars().take(60).collect();
+                    info!("✅ 周期恢复正常运行（此前故障: {brief}）");
+                    notify.send(&format!("[quantkit 实盘] ✅ 已恢复正常运行（此前故障: {brief}）")).await;
+                }
+            }
+            Err(e) => {
+                error!("本轮失败（下轮重试）: {e}");
+                // 同一错误只推送一次：持续性故障（拒单/断网）若每轮都推会刷屏 Telegram，
+                // 日志仍每轮记录；错误内容变化或恢复时才会再次推送
+                if dedup.cycle_err.as_deref() != Some(e.as_str()) {
+                    dedup.cycle_err = Some(e.clone());
+                    notify.send(&format!(
+                        "[quantkit 实盘] 本轮执行失败（下轮重试；同类错误不再重复推送，恢复时另行通知）: {e}"
+                    )).await;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(cfg.poll_secs)).await;
     }
@@ -714,7 +731,9 @@ async fn preflight(client: &mut BinanceClient, cfg: &AppConfig) -> Result<f64, (
     }
     for sym in &cfg.symbols {
         match client.fetch_step_size(sym).await {
-            Ok((step, min_qty)) => info!("⚙️  自检-{sym} 精度: stepSize={step} minQty={min_qty}"),
+            Ok((step, min_qty, min_notional)) => {
+                info!("⚙️  自检-{sym} 精度: stepSize={step} minQty={min_qty} minNotional={min_notional}")
+            }
             Err(e) => {
                 error!("自检-{sym} 精度查询失败: {e}");
                 return Err(());
@@ -735,6 +754,16 @@ async fn preflight(client: &mut BinanceClient, cfg: &AppConfig) -> Result<f64, (
     Ok(fee_rate)
 }
 
+/// 报警去重状态（内存级，重启后重置）：同类报警只在内容变化时推送一次，
+/// 防止持续性故障每个轮询周期都发 Telegram 造成报警风暴（DOGE -1013 事件教训）。
+#[derive(Default)]
+struct AlertDedup {
+    /// 最近一次已推送的“周期失败”错误文本
+    cycle_err: Option<String>,
+    /// 最近一次已推送的“预算不足跳过买入”品种集合键
+    buy_skips: Option<String>,
+}
+
 /// 单轮：权益快照（盯市）-> 收盘数据重放 -> 目标持仓 -> 差量真实下单 -> 原子保存
 async fn run_cycle(
     cfg: &AppConfig,
@@ -745,6 +774,7 @@ async fn run_cycle(
     fee_rate: f64,
     notify: &Notifier,
     event_bus: Option<&Arc<QuantKitEventBus>>, // 改为事件总线
+    dedup: &mut AlertDedup,
 ) -> Result<(), String> {
     let now = now_ms();
 
@@ -862,8 +892,9 @@ async fn run_cycle(
             .filter(|p| !targets.contains(&p.symbol))
             .cloned()
             .collect();
+        let mut unsellable: Vec<String> = Vec::new(); // 卖出价值低于最小下单额的尘埃仓
         for h in &to_sell {
-            let (step, _) = client.fetch_step_size(&h.symbol).await
+            let (step, _, min_notional) = client.fetch_step_size(&h.symbol).await
                 .map_err(|e| format!("精度查询失败: {e}"))?;
             // 钳制：不超过交易所真实可用余额（交易所无该资产则跳过并告警）
             let qty = match actual.as_ref().and_then(|m| m.get(base_of(&h.symbol))) {
@@ -879,6 +910,17 @@ async fn run_cycle(
                     0.0
                 }
             };
+            // 尘埃仓守卫：卖出价值低于交易所最小下单额必被拒（-1013 NOTIONAL），
+            // 跳过下单并保留在状态中，避免买入侧 DOGE 同款拒单死循环出现在卖出侧
+            if qty > 0.0 && min_notional > 0.0 {
+                let px = client.fetch_last_price(&h.symbol).await.unwrap_or(h.avg_entry_price);
+                if qty * px < min_notional {
+                    warn!("{} 卖出价值 ${:.2} 低于最小下单额 ${:.2}，跳过尘埃仓",
+                        h.symbol, qty * px, min_notional);
+                    unsellable.push(h.symbol.clone());
+                    continue;
+                }
+            }
             if qty > 0.0 {
                 // 确定性幂等 ID：同 bar+品种+方向重试时 ID 相同，交易所据此防重复下单
                 let id = format!("qk_{}_{}_S", last_bar_ts, h.symbol);
@@ -904,7 +946,8 @@ async fn run_cycle(
                 });
             }
         }
-        st.positions.retain(|p| targets.contains(&p.symbol));
+        // 卖不掉的尘埃仓保留在状态中，防止“状态已删、交易所仍在”的对账反复漂移
+        st.positions.retain(|p| targets.contains(&p.symbol) || unsellable.contains(&p.symbol));
 
         // 3b) 再买：新进入品种以真实可用余额等额分配（留存品种不调仓）。
         //     下单前过风控闸门（只拦开新仓，永不拦卖出回笼资金）
@@ -913,19 +956,23 @@ async fn run_cycle(
             .filter(|t| !held_syms.contains(t))
             .cloned()
             .collect();
-        if !new_targets.is_empty() {
+        if new_targets.is_empty() {
+            // 本轮无新买入品种：清除跳过通知状态，下次再出现同类跳过时重新通知
+            dedup.buy_skips = None;
+        } else {
             // 3b-i) 候选品种行情与精度（下单必需，先一次性取齐）
-            let mut quotes: Vec<(String, f64, f64, f64)> = Vec::new(); // (品种, 最新价, step, minQty)
+            let mut quotes: Vec<(String, f64, f64, f64, f64)> = Vec::new(); // (品种, 最新价, step, minQty, minNotional)
             for sym in &new_targets {
                 let price = client.fetch_last_price(sym).await
                     .map_err(|e| format!("价格查询失败: {e}"))?;
-                let (step, min_qty) = client.fetch_step_size(sym).await
+                let (step, min_qty, min_notional) = client.fetch_step_size(sym).await
                     .map_err(|e| format!("精度查询失败: {e}"))?;
-                quotes.push((sym.clone(), price, step, min_qty));
+                quotes.push((sym.clone(), price, step, min_qty, min_notional));
             }
 
             // 3b-ii) 风控闸门：输入全部来自持久化状态（重启不丢），输出放行清单
             // (品种, 最新价, 数量, minQty)
+            let mut low_budget: Vec<(String, f64, f64)> = Vec::new(); // (品种, 预算价值, 最小下单额)
             let buys: Vec<(String, f64, f64, f64)> = {
                 // 敞口取最近一次权益快照的盯市市值（卖出发生在本轮快照之后，
                 // 数值可能略偏旧；该口径仅在总敞口规则启用时影响判断）
@@ -963,12 +1010,12 @@ async fn run_cycle(
                         };
 
                     // 品种级：黑名单 / 极端涨跌幅
-                    let mut kept: Vec<(String, f64, f64, f64)> = Vec::new();
+                    let mut kept: Vec<(String, f64, f64, f64, f64)> = Vec::new();
                     let mut skipped: Vec<String> = Vec::new();
-                    for (sym, price, step, min_qty) in quotes {
+                    for (sym, price, step, min_qty, min_notional) in quotes {
                         let reasons = risk::gate_symbol(&cfg.risk, &sym, volat.get(&sym).copied());
                         if reasons.is_empty() {
-                            kept.push((sym, price, step, min_qty));
+                            kept.push((sym, price, step, min_qty, min_notional));
                         } else {
                             skipped.push(format!("{sym}: {}", reasons.join("；")));
                         }
@@ -994,8 +1041,14 @@ async fn run_cycle(
                         // 预留约 0.2% 余量（单边手续费 + 市价成交价可能高于最新价），再按品种数均分
                         let per = bal * 0.998 / kept.len() as f64;
                         let mut buys = Vec::new();
-                        for (sym, price, step, min_qty) in kept {
+                        for (sym, price, step, min_qty, min_notional) in kept {
                             let qty = round_step(per / price, step);
+                            // 交易所硬约束守卫：低于最小下单额的订单必被拒（-1013 NOTIONAL），
+                            // 跳过该腿而不是整轮失败（小账户已知场景，现金释放后自动恢复）
+                            if qty * price < min_notional {
+                                low_budget.push((sym.clone(), qty * price, min_notional));
+                                continue;
+                            }
                             let reasons = risk::gate_order(&cfg.risk, &gate_ctx, &sym, price, qty);
                             if !reasons.is_empty() {
                                 let msg = format!("风控拦截 {sym} 订单: {}", reasons.join("；"));
@@ -1009,6 +1062,27 @@ async fn run_cycle(
                     }
                 }
             };
+
+            // 预算不足跳过：品种集合变化时通知一次（开始跳过/恢复买入各一条），
+            // 持续期间只写 warn 日志，不再每轮推 Telegram（DOGE -1013 事件教训）
+            let skip_key = (!low_budget.is_empty())
+                .then(|| low_budget.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>().join(";"));
+            if skip_key != dedup.buy_skips {
+                if skip_key.is_some() {
+                    let detail = low_budget
+                        .iter()
+                        .map(|(s, v, m)| format!("{s} 预算 ${v:.2}<最小 ${m:.2}"))
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    let msg = format!("买入预算低于交易所最小下单额，跳过: {detail}（现金释放后自动恢复）");
+                    warn!("⚠️ {msg}");
+                    notify.send(&format!("[quantkit 实盘] ⚠️ {msg}")).await;
+                } else if dedup.buy_skips.is_some() && !buys.is_empty() {
+                    info!("✅ 买入预算已恢复到最小下单额以上");
+                    notify.send("[quantkit 实盘] ✅ 买入预算已恢复到最小下单额以上，恢复买入").await;
+                }
+                dedup.buy_skips = skip_key;
+            }
 
             // 3b-iii) 放行品种下单
             for (sym, price, qty, min_qty) in &buys {

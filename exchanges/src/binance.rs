@@ -501,17 +501,19 @@ impl BinanceClient {
             .ok_or_else(|| BinanceError::Parse("serverTime 解析失败".into()))
     }
 
-    /// 查询品种精度（stepSize / minQty），用于下单前数量取整
-    pub async fn fetch_step_size(&self, symbol: &str) -> Result<(f64, f64), BinanceError> {
+    /// 查询品种下单元数据（stepSize / minQty / minNotional），用于下单前数量取整与最小价值守卫。
+    /// 最小价值过滤器新 API 名为 NOTIONAL、旧名 MIN_NOTIONAL，均不存在时返回 0.0（视为无约束）。
+    pub async fn fetch_step_size(&self, symbol: &str) -> Result<(f64, f64, f64), BinanceError> {
         let v = self
             .get_json("/api/v3/exchangeInfo", &format!("symbol={symbol}"))
             .await?;
-        let filter = v
+        let filters = v
             .pointer("/symbols/0/filters")
             .and_then(|f| f.as_array())
-            .and_then(|fs| {
-                fs.iter().find(|f| f.get("filterType").and_then(|t| t.as_str()) == Some("LOT_SIZE"))
-            })
+            .ok_or_else(|| BinanceError::Parse(format!("未找到 {symbol} 的 filters")))?;
+        let filter = filters
+            .iter()
+            .find(|f| f.get("filterType").and_then(|t| t.as_str()) == Some("LOT_SIZE"))
             .ok_or_else(|| BinanceError::Parse(format!("未找到 {symbol} 的 LOT_SIZE 过滤器")))?;
         let step: f64 = filter["stepSize"]
             .as_str()
@@ -521,7 +523,19 @@ impl BinanceClient {
             .as_str()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| BinanceError::Parse("minQty 解析失败".into()))?;
-        Ok((step, min_qty))
+        let min_notional: f64 = filters
+            .iter()
+            .find(|f| {
+                matches!(
+                    f.get("filterType").and_then(|t| t.as_str()),
+                    Some("NOTIONAL") | Some("MIN_NOTIONAL")
+                )
+            })
+            .and_then(|f| f.get("minNotional"))
+            .and_then(|n| n.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        Ok((step, min_qty, min_notional))
     }
 
     /// 查询 USDT 可用余额（启动自检用）
