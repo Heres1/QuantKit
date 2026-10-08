@@ -8,12 +8,14 @@
 //! - 安全：CORS 全开（读接口公开）；计算/写操作接口由 `X-API-Token` 保护，
 //!   令牌来自环境变量 `QUANTKIT_API_TOKEN`，未设置则全部拒绝（fail-closed）
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::{Path as AxPath, Query, State};
+use axum::extract::{ConnectInfo, Path as AxPath, Query, State};
 use axum::http::{header, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -209,7 +211,11 @@ pub async fn serve(cfg: AppConfig) {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("监听 {addr} 失败: {e}"));
-    axum::serve(listener, app).await.expect("web 服务退出");
+    // into_make_service_with_connect_info：把 TCP 对端地址注入请求扩展，
+    // token_guard 据此取「权威来源 IP」——8080 直接暴露时 XFF 头可被伪造，只有对端地址可信。
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .expect("web 服务退出");
 }
 
 fn resolve_cli_bin() -> PathBuf {
@@ -253,18 +259,37 @@ fn apply_cors_headers(h: &mut axum::http::HeaderMap) {
 
 /// Token 门禁：请求头 `X-API-Token` 须与环境变量 `QUANTKIT_API_TOKEN` 一致。
 /// 环境变量缺失/为空时一律拒绝（fail-closed），防止忘配置导致接口裸奔。
+///
+/// 来源 IP 取自 TCP 对端地址（ConnectInfo），不信任 X-Forwarded-For/X-Real-IP 头——
+/// 8080 直接对公网暴露时这些头可被伪造，只有对端地址权威，用于日志归因与限速。
+/// 同一来源在窗口内累计失败达阈值后临时封锁（返回 429），封锁期内后续失败直接拒绝。
 async fn token_guard(req: Request<Body>, next: Next) -> Response {
     let expected = std::env::var("QUANTKIT_API_TOKEN").ok();
     let provided = req.headers().get("X-API-Token").and_then(|v| v.to_str().ok());
+    let ip = peer_ip(&req);
+    let now = now_epoch_secs();
+
     if !token_matches(expected.as_deref(), provided) {
-        // 记录失败的尝试（包含来源IP）
-        let client_ip = req.headers()
-            .get("x-forwarded-for")
-            .or_else(|| req.headers().get("x-real-ip"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown");
-        eprintln!("[security] ❌ Token验证失败 from IP: {}", client_ip);
-        
+        // 失败：按对端 IP 计数并判断是否处于封锁期
+        let blocked = {
+            let mut map = fail_map().lock().unwrap_or_else(|e| e.into_inner());
+            let next_win = push_fail(map.get(&ip).copied(), now, FAIL_WINDOW_SECS, FAIL_MAX, FAIL_BLOCK_SECS);
+            let is_blocked = next_win.blocked_until > now;
+            map.insert(ip, next_win);
+            is_blocked
+        };
+        if blocked {
+            eprintln!("[security] 🚫 速率限制封锁 from IP: {ip}");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "失败次数过多，来源 IP 已临时封锁，请稍后再试"
+                })),
+            )
+                .into_response();
+        }
+        eprintln!("[security] ❌ Token验证失败 from IP: {ip}");
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -274,16 +299,69 @@ async fn token_guard(req: Request<Body>, next: Next) -> Response {
         )
             .into_response();
     }
-    
-    // 记录成功的API访问
-    let client_ip = req.headers()
-        .get("x-forwarded-for")
-        .or_else(|| req.headers().get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
-    println!("[security] ✅ API访问 from IP: {} | Path: {}", client_ip, req.uri().path());
-    
+
+    // 成功：清除该来源的失败窗口（正常用户永不触发限速）
+    if let Ok(mut map) = fail_map().lock() {
+        map.remove(&ip);
+    }
+    println!("[security] ✅ API访问 from IP: {ip} | Path: {}", req.uri().path());
+
     next.run(req).await
+}
+
+// ---------------- 来源限速（按 TCP 对端 IP 的失败窗口） ----------------
+
+/// 失败窗口阈值：窗口内累计 FAIL_MAX 次鉴权失败即封锁 FAIL_BLOCK_SECS 秒。
+/// 单次误输令牌不会触达（需连续 10 次/分钟），暴力破解则很快被封。
+const FAIL_WINDOW_SECS: i64 = 60;
+const FAIL_MAX: u32 = 10;
+const FAIL_BLOCK_SECS: i64 = 300;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FailWindow {
+    count: u32,
+    window_start: i64,
+    blocked_until: i64,
+}
+
+/// 纯函数：给定上一窗口与当前时间，产出新窗口。可达性高，便于单测。
+/// - 若仍处封锁期：原样保留（封锁不因新请求而延长）。
+/// - 否则：窗口内累加计数，越过阈值时设定 blocked_until。
+fn push_fail(prev: Option<FailWindow>, now: i64, window_secs: i64, max_fails: u32, block_secs: i64) -> FailWindow {
+    if let Some(w) = prev {
+        if now < w.blocked_until {
+            return w;
+        }
+    }
+    let base = match prev {
+        Some(w) if now - w.window_start < window_secs => {
+            FailWindow { count: w.count.saturating_add(1), window_start: w.window_start, blocked_until: 0 }
+        }
+        _ => FailWindow { count: 1, window_start: now, blocked_until: 0 },
+    };
+    if base.count >= max_fails {
+        FailWindow { blocked_until: now + block_secs, ..base }
+    } else {
+        base
+    }
+}
+
+/// 进程级失败窗口表（单 web 进程，OnceLock 惰性初始化即可）。
+fn fail_map() -> &'static std::sync::Mutex<HashMap<IpAddr, FailWindow>> {
+    static MAP: OnceLock<std::sync::Mutex<HashMap<IpAddr, FailWindow>>> = OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 取权威来源 IP：优先 TCP 对端（ConnectInfo），退化 0.0.0.0（正常不会发生）。
+fn peer_ip(req: &Request<Body>) -> IpAddr {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+}
+
+fn now_epoch_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// 纯函数令牌比对（与环境读取分离，可单测）。期望值为空视为未配置 -> 拒绝。
@@ -2348,6 +2426,38 @@ mod tests {
         // 未配置（None 或空）一律拒绝：fail-closed
         assert!(!token_matches(None, Some("secret")));
         assert!(!token_matches(Some(""), Some("")));
+    }
+
+    #[test]
+    fn test_push_fail_counts_within_window() {
+        // 首次失败：计数 1，未封锁
+        let w1 = push_fail(None, 1000, 60, 3, 300);
+        assert_eq!((w1.count, w1.blocked_until), (1, 0));
+        // 窗口内累加
+        let w2 = push_fail(Some(w1), 1010, 60, 3, 300);
+        assert_eq!((w2.count, w2.blocked_until), (2, 0));
+        // 第 3 次越过阈值 -> 设定封锁到 now+block
+        let w3 = push_fail(Some(w2), 1020, 60, 3, 300);
+        assert_eq!((w3.count, w3.blocked_until), (3, 1320));
+    }
+
+    #[test]
+    fn test_push_fail_window_expiry_resets() {
+        let w1 = push_fail(None, 1000, 60, 5, 300);
+        // 超出 60s 窗口：重新从 1 计数，窗口起点前移
+        let w2 = push_fail(Some(w1), 1061, 60, 5, 300);
+        assert_eq!((w2.count, w2.window_start), (1, 1061));
+    }
+
+    #[test]
+    fn test_push_fail_stays_blocked_and_not_extended() {
+        let blocked = FailWindow { count: 5, window_start: 1000, blocked_until: 1300 };
+        // 封锁期内的新失败：原样保留，既不延长封锁也不清零
+        let w = push_fail(Some(blocked), 1200, 60, 5, 300);
+        assert_eq!(w, blocked);
+        // 封锁期满（now>=blocked_until）：视为新窗口重新计数
+        let w2 = push_fail(Some(blocked), 1300, 60, 5, 300);
+        assert_eq!((w2.count, w2.blocked_until), (1, 0));
     }
 
     fn snap(ts: u64, total: f64) -> EquitySnap {
