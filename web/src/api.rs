@@ -279,7 +279,7 @@ async fn token_guard(req: Request<Body>, next: Next) -> Response {
             is_blocked
         };
         if blocked {
-            eprintln!("[security] 🚫 速率限制封锁 from IP: {ip}");
+            eprintln!("[{}] [security] 🚫 速率限制封锁 from IP: {ip}", now_str());
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({
@@ -289,7 +289,7 @@ async fn token_guard(req: Request<Body>, next: Next) -> Response {
             )
                 .into_response();
         }
-        eprintln!("[security] ❌ Token验证失败 from IP: {ip}");
+        eprintln!("[{}] [security] ❌ Token验证失败 from IP: {ip}", now_str());
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -304,7 +304,11 @@ async fn token_guard(req: Request<Body>, next: Next) -> Response {
     if let Ok(mut map) = fail_map().lock() {
         map.remove(&ip);
     }
-    println!("[security] ✅ API访问 from IP: {ip} | Path: {}", req.uri().path());
+    println!(
+        "[{}] [security] ✅ API访问 from IP: {ip} | Path: {}",
+        now_str(),
+        req.uri().path()
+    );
 
     next.run(req).await
 }
