@@ -212,7 +212,7 @@ pub async fn serve(cfg: AppConfig) {
         .await
         .unwrap_or_else(|e| panic!("监听 {addr} 失败: {e}"));
     // into_make_service_with_connect_info：把 TCP 对端地址注入请求扩展，
-    // token_guard 据此取「权威来源 IP」——8080 直接暴露时 XFF 头可被伪造，只有对端地址可信。
+    // token_guard 据此判定来源（回环对端=同机 nginx 反代，才采信代理头）。
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .expect("web 服务退出");
@@ -260,13 +260,13 @@ fn apply_cors_headers(h: &mut axum::http::HeaderMap) {
 /// Token 门禁：请求头 `X-API-Token` 须与环境变量 `QUANTKIT_API_TOKEN` 一致。
 /// 环境变量缺失/为空时一律拒绝（fail-closed），防止忘配置导致接口裸奔。
 ///
-/// 来源 IP 取自 TCP 对端地址（ConnectInfo），不信任 X-Forwarded-For/X-Real-IP 头——
-/// 8080 直接对公网暴露时这些头可被伪造，只有对端地址权威，用于日志归因与限速。
-/// 同一来源在窗口内累计失败达阈值后临时封锁（返回 429），封锁期内后续失败直接拒绝。
+/// 来源 IP 由 `client_ip` 判定（回环对端=受信任 nginx，采信代理头；外部对端=只用 TCP 对端），
+/// 用于日志归因与限速。同一来源在窗口内累计失败达阈值后临时封锁（返回 429），
+/// 封锁期内后续失败直接拒绝。
 async fn token_guard(req: Request<Body>, next: Next) -> Response {
     let expected = std::env::var("QUANTKIT_API_TOKEN").ok();
     let provided = req.headers().get("X-API-Token").and_then(|v| v.to_str().ok());
-    let ip = peer_ip(&req);
+    let ip = client_ip(&req);
     let now = now_epoch_secs();
 
     if !token_matches(expected.as_deref(), provided) {
@@ -362,6 +362,34 @@ fn peer_ip(req: &Request<Body>) -> IpAddr {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+}
+
+/// 归因与限速用的客户端 IP。
+///
+/// 8080 前有一台同机 nginx（443/80 反代），经它进来的请求 TCP 对端恒为 127.0.0.1，
+/// 直接拿对端做限速会把全体真实客户端折叠成一个回环地址——一个攻击者就能把
+/// 所有走 443 的正常访问一起锁死。故：对端是回环（只有本机的受信任代理能这样连）时
+/// 采信 X-Real-IP / X-Forwarded-For 首项；对端是外部地址时忽略这些头，
+/// 因为公网直连时它们可被随意伪造。
+fn client_ip(req: &Request<Body>) -> IpAddr {
+    let peer = peer_ip(req);
+    if !peer.is_loopback() {
+        return peer;
+    }
+    forwarded_ip(req).unwrap_or(peer)
+}
+
+/// 从代理头取第一个可解析的 IP；X-Real-IP 优先（nginx 显式设置，不受 XFF 链伪造影响）。
+fn forwarded_ip(req: &Request<Body>) -> Option<IpAddr> {
+    for name in ["x-real-ip", "x-forwarded-for"] {
+        let Some(raw) = req.headers().get(name).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        if let Some(ip) = raw.split(',').next().and_then(|s| s.trim().parse::<IpAddr>().ok()) {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 fn now_epoch_secs() -> i64 {
@@ -2430,6 +2458,37 @@ mod tests {
         // 未配置（None 或空）一律拒绝：fail-closed
         assert!(!token_matches(None, Some("secret")));
         assert!(!token_matches(Some(""), Some("")));
+    }
+
+    #[test]
+    fn test_client_ip_trusts_proxy_headers_only_from_loopback() {
+        // 回环对端（同机 nginx 反代）：采信 X-Real-IP，优先于 XFF
+        let r = req_from("127.0.0.1:8080", &[("X-Real-IP", "203.0.113.7"), ("X-Forwarded-For", "198.51.100.1")]);
+        assert_eq!(client_ip(&r), "203.0.113.7".parse::<IpAddr>().unwrap());
+        // 无 X-Real-IP 时取 XFF 首项（后续元素是代理链，不可信）
+        let r = req_from("127.0.0.1:8080", &[("X-Forwarded-For", "203.0.113.9, 10.0.0.1")]);
+        assert_eq!(client_ip(&r), "203.0.113.9".parse::<IpAddr>().unwrap());
+        // 外部对端：代理头一律忽略——公网直连时任何人都能伪造
+        let r = req_from("203.0.113.10:5555", &[("X-Real-IP", "8.8.8.8")]);
+        assert_eq!(client_ip(&r), "203.0.113.10".parse::<IpAddr>().unwrap());
+        // 头不可解析：回退 TCP 对端，不影响放行判断
+        let r = req_from("[::1]:8080", &[("X-Real-IP", "not-an-ip")]);
+        assert_eq!(client_ip(&r), "::1".parse::<IpAddr>().unwrap());
+        // 无扩展（理论不该发生）：0.0.0.0 而非 panic
+        let r = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(client_ip(&r), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    /// 构造带 TCP 对端与任意请求头的测试请求（ConnectInfo 模拟 axum 注入）。
+    fn req_from(peer: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder();
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        req
     }
 
     #[test]
